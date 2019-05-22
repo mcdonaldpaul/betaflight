@@ -1,0 +1,2123 @@
+Software libraries for STM32 microprocessor:
+Cortex Microcontroller Software Interface Standard (CMSIS) defined by ARM. 
+It is not an API specification, it's an organizational and style standard.
+
+Crsf stands for Crossfire
+msc stands for Mass Storage Controller (part of usb-vcp protocol? ) 
+msp stands for MultiWii Serial Protocol
+
+2-DOF or 2DOF - stands for two degrees of freedom and is used in PID Controller.
+/*
+  booked software out of GitHub with following command:
+*/
+
+>git clone https://github.com/betaflight/betaflight.git
+
+main (main.c)
+  init (fc/fc_init)
+    drivers/system_stm32f4xxx.c::systemInit {
+      SetSysClock
+      NVIC_..... (Nested Vector Interrupt Controller) (for documentation look under StdPeriph_Driver->Misc->Functions)
+      drivers/system_stm32f4xx::enableGPIOPowerUsageAndNoiseReductions {
+         // sets up RCC and GPIO
+      }
+      drivers/system::cycleCounterInit
+      SysTick_Config
+    }
+    IOInitGlobal
+    initEEPROM
+    ensureEEPROMContainsValidData
+    readEEPROM
+    timerInit
+    #if defined(USE_UART) drivers/serial_uart_pinconfig::uartPinConfigure( serialPinConfig() );
+    serialInit {
+      // populates table: serialPortUsageList
+      // check port to pin mappings and if unvalid - marks the port as such in
+      // serialPortUsageList, also decrease: serialPortCount.
+    }
+    mixerInit
+    mixerConfigureOutput
+    motorDevInit (drivers/pwm_output)
+    failsafeInit
+    spiPinConfigure
+    spiPreInit
+    drivers/bus_spi::spiInit { initializes the SPI Bus }
+
+    sensorsAutodetect (sensors/initialisation) {
+      gyroInit (sensors/gyro)
+         gyroInitSensor (sensors/gyro)
+            gyroDetect (sensors/gyro)
+               icm20689SpiGyroDetect
+                   gyro->initFn = icm200689GyroInit
+                   gyro->readFn = mpuGyroReadSPI (drivers/accgyro/accgyro_mpu)
+                   gyro->scale = ...
+      
+      accInit (sensors/acceleration)
+          accDetect (sensors/acceleration)
+             icm20689SpiAccDetect
+                acc->initFn = icm20689AccInit
+                acc->readFn = mpuAccRead (drivers/accgyro/accgyro_mpu)
+      compassInit (sensors/compass)
+        compassDetect() (sensors/compass)
+      baroDetect (sensors/barometer)
+      rangefinderInit
+      adcInternalInit
+    }
+
+    validateAndFixGyroConfig
+    pidInit
+    accInitFilters
+
+    imuInit
+    mspInit
+    mspSerialInit
+    rxInit (rx/rx)
+    batteryInit
+    pwmEnableMotors
+    fcTasksInit (fc/fc_tasks)
+       for_each task that needs to run - add the task in fc/fc_tasks::cfTasks[] to scheduler queue: scheduler/scheduler::taskQueueArray
+         setTaskEnabled
+           queueAdd
+
+  run (forever)
+    scheduler (scheduler/scheduler)
+    processLoopback (fc/fc_init)
+
+
+##################### Scheduling ######################
+file: scheduler/schedular
+queue: taskQueueArray (scheduler/scheduler)
+
+The following tasks are all defined in fc/fc_tasks 
+in array cfTasks used by scheduler (scheduler/scheduler)
+
+scheduler
+        if( Task->checkFunc )
+          { add task to queue }
+
+        for task with highest priority in queue do:
+                selectedTask->taskFunc
+
+#############################################################
+
+.taskName = "SYSTEM"
+.taskFunc = scheduler/scheduler::taskSystem {
+        computes load percentages 
+}
+
+if( task->checkFunc ) 
+  task->taskAgeCycles = 1 + (currentTimeUs - task->lastSignaledAt) / task->desiredPeriod;
+else
+  task->taskAgeCycles = (currentTimeUs - task->lastExecutedAt) / task->desiredPeriod;
+
+
+task->dynamicPriority = 1 + task->staticPriority * task->taskAgeCycles;
+
+
+taskBatteryAlerts
+batteryUpdateVoltage
+batteryUpdateCurrentMeter
+
+###################################################################
+
+imuMahonyAHRSupdate
+  imuComputeRotationMatrix
+    imuQuaternionComputeProducts
+
+imuComputeQuaternionFromRPY
+  imuComputeRotationMatrix
+    imuQuaternionComputeProducts
+
+imuSetAttitudeQuat
+  imuComputeRotationMatrix
+    imuQuaternionComputeProducts
+  imuUpdateEulerAngles
+
+imuUpdateEulerAngles
+  imuQuaternionComputeProducts
+
+imuQuaternionHeadfreeTransformVectorEarthToBody
+  imuQuaternionComputeProducts
+
+taskFunc = imuUpdateAttitude
+  imuCalculateEstimatedAttitude
+    gyroGetAccumulationAverage -> gyroAverage
+    accGetAccumulationAverage -> accAverage
+    imuMahonyAHRSupdate -> q
+      q -> imuComputeRotationMatrix -> rMat
+        imuQuaternionComputeProducts
+    imuUpdateEulerAngles -> attitude.values
+      if( headfree_mode )
+        headfree -> imuQuaternionComputeProducts
+      else
+        rMat -> 
+
+
+################################# PID / Motors Task ###############################3
+
+.taskName = "PID"
+.taskFunc = fc/fc_core::taskMainPidLoop {
+        gyroUpdate (sensors/gyro) -> gyro
+        subTaskPidController  (fc/fc_core)
+                setpointRate[], gyro.gyroADCf[] -> pidController (flight/pid) -> pidData
+        subTaskMotorUpdate (fc/fc_core)
+                pidData, rcCommand[THROTTLE] -> mixTable (flight/mixer) -> motorMix[motorCount]
+                         rcCommand[THROTTLE] -> calculateThrottleAndCurrentMotorEndpoints { 
+                              // find limits to to motor settings, set following global variables:
+                              // throttle, motorRangeMin/Max, motorOutputMin, motorOutputRange, motorOutputMixSign
+                              // which are used by applyMixToMotors
+                         motorMix[] -> applyMixToMotors (flight/mixer) -> motor[motorCount]
+                writeMotors (flight/mixer)
+                         motor[] -> pwmWriteMotor (drivers/pwm_output) -> ESC's
+                               pmwWrite
+        subTaskMainSubprocesses (fc/fc_core)
+                processRcCommand (fc/fc_rc)
+                        rcCommand[] -> calculateSetpointRate (fc/fc_rc) -> setpointRate[], rcDeflection[], rcDeflectionAbs[]
+                                    applyRates() (set to one of either: applyBetaflightRates or applyRaceFlightRates)
+				        /* Check spreadsheet for channel mapping */
+}
+
+%%%%%%%%%%%%%%%%%%%%%% pidController (Proportional-Integral-Derivative) %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+../flight/pid.h:38:#define PTERM_SCALE 0.032029f
+../flight/pid.h:39:#define ITERM_SCALE 0.244381f
+../flight/pid.h:40:#define DTERM_SCALE 0.000529f
+from pidProfile: 
+[PID_ROLL] =  { 40, 40, 30 }, /* KrP,KrI,KrD */
+[PID_PITCH] = { 58, 50, 35 }, /* KpP,KpI,KpD */
+[PID_YAW] =   { 70, 45, 20 }, /* KyP,KyI,KyD */
+#define PID_PROCESS_DENOM_DEFAULT       2
+gyro.targetLoopTime = 31.5 or 32 (kHz)
+targetPidLooptime = gyro.targetLooptime * pidConfig()->pid_process_denom) = 2 * 31.5 = 63 ???; // Initialize pid looptime
+dT = (float)targetPidLooptime * 0.000001f = 63 * 0.000001 = 0.000 063 ????
+
+tpaFactor = getThrottlePIDAttenuation(); (ranges from 1.0 to 0.9 for full throttle)
+
+currentPidSetpoint = getSetpointRate(axis);
+
+// -----calculate error rate
+// Process variable from gyro output in deg/sec
+errorRate = currentPidSetpoint - gyro.gyroADCf[axis]; // r - y
+/* currentPidSetpoint ranges from -1998 to +1998 and I suppose the same goes for gyroADCf ??? */
+
+// -----calculate P component and add Dynamic Part based on stick input
+// ****************************************************************
+pidData[axis].P = pidCoefficient[axis].Kp * errorRate * tpaFactor;
+if (axis == FD_YAW) {
+  pidData[axis].P = ptermYawLowpassApplyFn((filter_t *) &ptermYawLowpass, pidData[axis].P);
+}
+
+// -----calculate I component
+// ****************************************************************
+// Dynamic i component,
+// gradually scale back integration when above windup point
+
+pidProfile->itermWindupPointPercent = 50,
+ITermWindupPoint = (float)pidProfile->itermWindupPointPercent / 100.0f;
+ITermWindupPointInv = 1.0f / (1.0f - ITermWindupPoint) = 1/(1 - 0.5) = 2;
+
+itermAccelerator = 1.0f;
+motorMixRange = flight/mixer::getMotorMixRange() { 
+   return motorMixMax - motorMixMin; // min and max in the motorMix[] table (output from mixTable) 
+   will be 0 in beginning.
+}
+dynCi = MIN( (1.0f - motorMixRange) * ITermWindupPointInv, 1.0f ) * dT * itermAccelerator;
+
+pidData[axis].I =  = pidData[axis].I + pidCoefficient[axis].Ki * errorRate * dynCi;
+
+// -----calculate D component
+// ****************************************************************
+if( axis != YAW ) {
+
+  // Dynamic d component, enable 2-DOF PID controller only for rate mode
+  pidProfile-dtermSetpointWeight = 0;
+  dtermSetpointWeight = pidProfile->dtermSetpointWeight / 127.0f;
+  dynCd = flightModeFlags ? 0.0f : dtermSetpointWeight;
+
+  gyroRateDterm[ROLL,PITCH] = filtered( gyro.gyroADCf[ROLL,PITCH] );
+
+  // no transition if relaxFactor == 0
+  relaxFactor = (pidProfile->setpointRelaxRatio != 0)?100.0f/pidProfile->setpointRelaxRatio:0;
+  transition = relaxFactor > 0 ? MIN(1.f, getRcDeflectionAbs(axis) * relaxFactor) : 1;
+
+  pidData[axis].D = pidCoefficient[axis].Kd * tpaFactor / dT * (
+    dynCd * transition * (currentPidSetpoint - previousPidSetpoint[axis]) - // this line only used in Acro mode 
+      (gyroRateDterm[axis] - previousGyroRateDterm[axis])
+  );;
+
+= (sp_c - sp_p) - (g_c - g_p)
+= (sp_c - g_c) - sp_p + g_p
+= (sp_c - g_c) - (sp_p - g_p)
+= delta_c - delta_p
+}
+
+previousPidSetpoint[axis] = currentPidSetpoint;
+previousGyroRateDterm[axis] = gyroRateDterm[axis];
+
+// calculating the PID sum
+pidData[FD_ROLL ].Sum = pidData[FD_ROLL ].P + pidData[FD_ROLL ].I + pidData[FD_ROLL ].D;
+pidData[FD_PITCH].Sum = pidData[FD_PITCH].P + pidData[FD_PITCH].I + pidData[FD_PITCH].D;
+
+###########################################################################
+
+taskUpdateAccelerometer (fc/fc_tasks)
+        accUpdate (sensors/acceleration)
+imuUpdateAttitude (fc/imu)
+        imuCalculateEstimatedAttitude (fc/imu)
+
+dispatchProcess (fc/fc_dispatch)
+
+Target Setup
+############
+platform.h
+        target/common_fc_pre.h
+        target/$(BUILD/target.h
+        target/common_fc_post.h
+        target/common_defaults_post.h
+
+############################  Configuration  ############################
+
+Important files:
+        config/features
+        pg/pg
+        config/config_eeprom
+        config/config_streamer
+
+featureConfig declared and defined in config/feature
+  just contains a int32 in which the features are bit-mapped using: config/feature/features_e 
+which in the template initialization is configured to:
+DEFAULT_FEATURES | DEFAULT_RX_FEATURE which are defined in: target/<PCB>/target.h
+
+DEFAULT_FEATURES get set in the target.h files for each target/<PCB> 
+  to FEATURE_... where FEATURE_... is defined in config/feature.h
+
+For EEPROM or FLASH
+__config_start and __config_end are initialized in files: target/link/stm32_flashxxx.ld from:
+FLASH_CONFIG which is setup in: target/link/stm32_flash_fxxx_yyk
+
+from config/config_streamer.c:
+# elif defined(STM32F40_41xxx)
+#  define FLASH_PAGE_SIZE                 ((uint32_t)0x4000) // 16K sectors
+
+writeEEPROM (fc/config)
+        writeConfigToEEPROM (config/config_eeprom)
+              attempts to do up to 3 times the following
+                writeSettingsToEEPROM (config/config_eeprom) {
+                    write all configs in the pgRegistry to EEPRom as follow:
+                    write config_header to eeprom and update CRC with written data
+                    for each config in pgRegistry do following:
+                        encapsule pgRegistry_entry and config_data into a config_record.
+                        write config_record to eeprom and update CRC with written data
+                    write config_footer to eeprom and update CRC with written data
+                    write CRC to eeprom
+                }
+                  config/config_streamer::
+                    config_streamer_init
+                    config_streamer_start
+                        FLASH_Unlock
+                        FLASH_ClearFlag
+                    config_streamer_write
+                      write_word
+                        FLASH_EraseSector( GETFlashSectorForEEPROM )  //Erases for 
+                        FLASH_ProgramWord
+                    config_streamer_flush
+                      write_word
+                    config_streamer_finish
+                        FLASH_Lock
+
+readEEPROM (fc/config)
+        loadEEPROM (config/config_eeprom.c)
+                findEEPROM
+                pgLoad (pg/pg)
+                pgReset (pg/pg)
+        validateAndFixConfig (fc/config)
+                if( !isSerialConfigValid( serialConfig() )
+                        serialPortIdentifiers[] -> pgResetFn_serialConfig( serialConfigMutable() ) 
+                                {serialConfig->portConfigs[SERIALRX_UART].functionMask = FUNCTION_RX_SERIAL - 
+                                 see comments for SERIALRX_UART. }
+                
+        activeConfig (config.c)
+
+resetEEPROM (fc/config)
+        resetConfigs (fc/config)
+                pgResetAll
+                #ifdef( USE_TARGET_CONFIG ) targetConfiguration
+                setPidProfile
+                SetControlRateProfile(0)
+        writeEEPROM
+
+saveConfigAndNotify (fc/config)
+        writeEEPROM
+        readEEPROM
+        beeperConfirmationBeeps(1)
+
+ensureEEPROMContainsValidData (fc/config)
+        isEEPROMContentValid (config/config_eeprom)
+        resetEEPROM
+
+#################### Binding Serial Ports: Function and Hardware ###################################
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% Communication Functions %%%%%%%%%%%%%%%%%%%%%%
+
+from io/serial.h:
+typedef enum {
+    FUNCTION_NONE                = 0,
+    FUNCTION_MSP                 = (1 << 0),  // 1
+    FUNCTION_GPS                 = (1 << 1),  // 2
+    FUNCTION_TELEMETRY_FRSKY_HUB = (1 << 2),  // 4
+    FUNCTION_TELEMETRY_HOTT      = (1 << 3),  // 8
+    FUNCTION_TELEMETRY_LTM       = (1 << 4),  // 16
+    FUNCTION_TELEMETRY_SMARTPORT = (1 << 5),  // 32
+    FUNCTION_RX_SERIAL           = (1 << 6),  // 64
+    FUNCTION_BLACKBOX            = (1 << 7),  // 128
+    FUNCTION_TELEMETRY_MAVLINK   = (1 << 9),  // 512
+    FUNCTION_ESC_SENSOR          = (1 << 10), // 1024
+    FUNCTION_VTX_SMARTAUDIO      = (1 << 11), // 2048
+    FUNCTION_TELEMETRY_IBUS      = (1 << 12), // 4096
+    FUNCTION_VTX_TRAMP           = (1 << 13), // 8192
+    FUNCTION_RCDEVICE            = (1 << 14), // 16384
+    FUNCTION_LIDAR_TF            = (1 << 15), // 32768
+} serialPortFunction_e;
+
+%%%%%%%%%%%%%%%%%%%%%%% Hardware Communications Ports setup %%%%%%%%%%%%%%%%%%%%%%%%%%5
+from io/serial:
+// serial port identifiers are now fixed, these values are used by MSP commands.
+typedef enum {
+    SERIAL_PORT_NONE = -1,
+    SERIAL_PORT_USART1 = 0,
+    SERIAL_PORT_USARTx,   // x = 2 - 8
+    SERIAL_PORT_USB_VCP = 20,
+    SERIAL_PORT_SOFTSERIAL1 = 30,
+    SERIAL_PORT_SOFTSERIAL2
+} serialPortIdentifier_e const serialPortIdentifiers[SERIAL_PORT_COUNT] = {
+Methods:
+  serialPortConfig_t* findSerialPortIndexByIdentifier( serialPortIdentifier_e )
+
+#ifdef USE_VCP            SERIAL_PORT_USB_VCP,
+#ifdef USE_UARTx          SERIAL_PORT_USARTx,       // x = 1 - 8
+#ifdef USE_SOFTSERIALy    SERIAL_PORT_SOFTSERIALy,  // y = 1 - 2
+};
+in above: SERIAL_PORT_COUNT, USE_VCP, USE_UARTx, USE_SOFTSERIALy are declared in target/{BOARD}/target.h
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%% Binding Hardware Ports with Communication Functions %%%%%%%%%%%%%%%%%%%%%
+
+SERIALRX_UART
+SBUS_TELEMETRY_UART
+(also: TELEMETRY_UART, ESC_SENSOR_UART) 
+normally defined in target/{BOARD}/target.h and set to a serialPortIdentifier_e
+
+from io/serial:
+typedef struct serialPortConfig_s {
+    uint16_t functionMask;                  // used for: serialPortFunction_e
+    serialPortIdentifier_e identifier;
+    uint8_t msp_baudrateIndex;
+    uint8_t gps_baudrateIndex;
+    uint8_t peripheral_baudrateIndex;
+    uint8_t telemetry_baudrateIndex; // not used for all telemetry systems, e.g. HoTT only works at 19200.
+} serialPortConfig_t;
+
+typedef struct serialConfig_s {
+    serialPortConfig_t portConfigs[SERIAL_PORT_COUNT];
+    uint8_t reboot_character;               // which byte is used to reboot. Default 'R', could be changed carefully to something else.
+} serialConfig_t;
+
+PG_REGISTER_WITH_RESET_FN(serialConfig_t, serialConfig, PG_SERIAL_CONFIG, 0);
+Methods:
+  serialPortConfig_t *findSerialPortConfig(serialPortFunction_e)
+  serialPortConfig_t *findNextSerialPortConfig(serialPortFunction_e)
+  serialPortConfig_t *serialFindPortConfiguration(serialPortIdentifier_e)
+
+io/serial::pgResetFn_serialConfig {
+  // populate serialConfig->PortConfigs[] from serialPortIdentifiers[]
+  serialConfig->portConfigs[0].functionMask = FUNCTION_MSP
+  #ifdef SERIALRX_UART        serialFindPortConfiguration( SERIALRX_UART )->functionMask = FUNCTION_RX_SERIAL
+  #ifdef SBUS_TELEMETRY_UART  serialFindPortConfiguration( SBUS_TELEMETRY_UART )->functionMask = FUNCTION_TELEMETRY_SMARTPORT
+
+  #if ( defined(USE_VCP) and defined( USE_MSP_UART ) and serialConfig->portConfigs[0].identifier == SERIAL_PORT_USB_VCP )
+      serialFindPortConfiguration( SERIAL_PORT_USART1 ).functionMask = FUNCTION_MSP
+}
+
+// ------------------------------------------------------------------------------
+
+static uint8_t serialPortCount;
+uint8_t serialGetAvailablePortCount(void) { return serialPortCount; }
+
+typedef struct serialPortUsage_s {
+    serialPort_t *serialPort;
+    serialPortFunction_e function;
+    serialPortIdentifier_e identifier;
+} serialPortUsage_t serialPortUsageList[SERIAL_PORT_COUNT];
+
+Methods:
+  serialPortUsage_t *findSerialPortUsageByIdentifier( serialPortIdentifier_e );
+  serialPortUsage_t *findSerialPortUsageByPort( serialPort_t* );
+  void serialRemovePort( serialPortIdentifier_e )
+  bool serialIsPortAvailable( serialPortIdentifier_e)
+  void serialInit( bool softserialEnabled, serialPortIdentifier_e serialPortToDisable )
+
+serialPort_t* io/serial::openSerialPort( serialPortIdentifier, serialPortFunction ) {
+    
+    if( serialPortUsage = findSerialPortUsageByIdentifier( serialPortIdentifier )->function != FUNCTION_NONE )
+      exit;
+    switch( serialPortIdentifier ) {
+      case SERIAL_PORT_USB_VCP: 
+          serialPort = usbVcpOpen (drivers/serial_usb_vcp), 
+      case SERIAL_PORT_USARTx:
+          serTcpOpen, (drivers/serial_tcp) (for SIMULATION_BUILD)
+          uartOpen,   (drivers/serial_uart_init) (ifnot SIMULATION_BUILD) { 
+             creates a port and 
+             /* set the port's rxCallback and rxCallbackData pointers to
+             the rxCallback and rxCallbackData pointers passed down to
+             openSerialPort (which would have been initialized by: rx modules:
+             ibus, sbus, crsf, fport, jetiexbus, sumh, sumd, xbus, spektrum
+             to rx/<protocol>DataReceive function declared in <module> ) */
+             uartPort_t = drivers/serial_uart_stm32fyxx::serialUART {
+                 uartDevice_t* uartdev = uartDevmap[device]
+                 uartPort_t uartPort = &uartdev->port
+             }
+          }
+      case SERIAL_PORT_SOFTSERIALy:
+        openSoftSerial, (drivers/serial_softserial)
+    }
+    serialPortUsage->function = function;
+    serialPortUsage->serialPort = serialPort
+    serialPort->identifier = serialPortIdentifier;
+}
+
+Mapping the io/serial::openSerialPort uses to map from serialPortIdentifier_e to UARTDevice_e
+io/serial.h:#define SERIAL_PORT_IDENTIFIER_TO_UARTDEV(x) ((x) - SERIAL_PORT_USART1 + UARTDEV_1)
+
+from drivers/serial_uart.h
+typedef enum {
+    UARTDEV_1 = 0,
+    UARTDEV_2 = 1,
+    UARTDEV_3 = 2,
+    UARTDEV_4 = 3,
+    UARTDEV_5 = 4,
+    UARTDEV_6 = 5,
+    UARTDEV_7 = 6,
+    UARTDEV_8 = 7
+} UARTDevice_e;
+
+// @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ // following from: drivers/serial @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+typedef struct serialPort_s {
+    const struct serialPortVTable *vTable;
+
+    uint8_t identifier;         // initialized by: io/serial::openSerialPort (and set to one of serialPortIdentifier_e)
+    portMode_t mode;            // initialized by one of: drivers/serial_escserial, serial_softserial, serial_tcp, serial_uart, serial_uart_hal, serial_uart_init
+    portOptions_t options;      // initialized by one of: drivers/serial_escserial, serial_softserial, serial_tcp, serial_uart, serial_uart_hal, serial_uart_init
+
+    uint32_t baudRate;          // initialized by one of: drivers/serial_escserial, serial_softserial, serial_tcp, serial_uart, serial_uart_hal, serial_uart_init, serial_uart_stm32fxx
+
+    volatile uint8_t *rxBuffer; // initialized by one of: drivers/serial_escserial, serial_softserial, serial_tcp, serial_uart_stm32fxx
+    uint32_t rxBufferSize;      // initialized by one of: drivers/serial_escserial, serial_softserial, serial_tcp, serial_uart_stm32fxx
+    uint32_t rxBufferHead;      // initialized by one of: drivers/serial_escserial, serial_softserial, serial_tcp, serial_uart_stm32fxx, serial_uart_hal, serial_uart_init
+    uint32_t rxBufferTail;      // initialized by one of: drivers/serial_escserial, serial_softserial, serial_tcp, serial_uart, serial_uart_hal, serial_uart_init
+
+    volatile uint8_t *txBuffer; // initialized by one of: drivers/serial_escserial, serial_softserial, serial_tcp, serial_uart_stm32fxx
+    uint32_t txBufferSize;      // initialized by one of: drivers/serial_escserial, serial_softserial, serial_tcp, serial_uart_stm32fxx
+    uint32_t txBufferHead;      // initialized by one of: drivers/serial_escserial, serial_softserial, serial_tcp, serial_uart, serial_uart_hal, serial_uart_init
+    uint32_t txBufferTail;      // initialized by one of: drivers/serial_escserial, serial_softserial, serial_tcp, serial_uart, serial_uart_hal, serial_uart_init, serial_uart_stm32fxx 
+
+    serialReceiveCallbackPtr rxCallback; // initialized by one of: drivers/serial_escserial, serial_softserial, serial_tcp,  serial_uart_hal, serial_uart_init
+    void *rxCallbackData;       // initialized by one of: drivers/serial_softserial, serial_tcp, serial_uart_hal, serial_uart_init
+} serialPort_t;
+
+struct serialPortVTable {
+    void (*serialWrite)(serialPort_t *instance, uint8_t ch);               // drivers/serial::serialPrint,serialWrite, serialWriteBuf, serialWriteShim
+
+    uint32_t (*serialTotalRxWaiting)(const serialPort_t *instance);        // drivers/serial::serialRxBytesWaiting
+    uint32_t (*serialTotalTxFree)(const serialPort_t *instance);           // drivers/serial::serialRxBytesWaiting
+
+    uint8_t (*serialRead)(serialPort_t *instance);                         // drivers/serial::serialRead
+
+    // Specified baud rate may not be allowed by an implementation, use serialGetBaudRate to determine actual baud rate in use.
+    void (*serialSetBaudRate)(serialPort_t *instance, uint32_t baudRate);  // drivers/serial::serialSetBaudRate
+
+    bool (*isSerialTransmitBufferEmpty)(const serialPort_t *instance);     // drivers/serial::isSerialTransmitBufferEmpty
+
+    void (*setMode)(serialPort_t *instance, portMode_e mode);              // drivers/serial::serialSetMode
+    void (*setCtrlLineStateCb)(serialPort_t *instance, void (*cb)(void *instance, uint16_t ctrlLineState), void *context);    // drivers/serial::serialSetCtrlLineStateCb
+    void (*setBaudRateCb)(serialPort_t *instance, void (*cb)(serialPort_t *context, uint32_t baud), serialPort_t *context);   // drivers/serial::serialSetBaudRateCb
+
+    void (*writeBuf)(serialPort_t *instance, const void *data, int count); // drivers/serial::serialWriteBuf, serialWriteBufShim
+    // Optional functions used to buffer large writes.
+    void (*beginWrite)(serialPort_t *instance);                            // drivers/serial::serialBeginWrite
+    void (*endWrite)(serialPort_t *instance);                              // drivers/serial::serialEndWrite
+};
+
+following all in drivers/serial_tcp:
+------------------------------------
+drivers/serial_tcp::tcpPort_t is defined as:
+typedef struct {
+        drivers/serial::serialPort_t port;
+        .
+        .
+        .
+} tcpPort_t;
+
+drivers/serial_uart::uartPort_t is defined as:
+typedef struct {
+        drivers/serial::serialPort_t port;
+        .
+        .
+        .
+} uartPort_t;
+
+therefore drivers/serial_tcp::tcpPort_t derives from drivers/serial::serialPort_t (tcpPort_t, uartPort_t is a type of (derives from) serialPort_t)
+
+drivers/serial::serialWriteBuf
+    drivers/serial::serialWrite
+        vTable->serialWrite (which has been set to for argument's sake tcpWrite)
+            tcpWrite
+                tcpDataOut
+                    dyad_write
+
+dyad_Listener
+        OnData
+                tcpDataIn
+vTable.serialRead = tcpRead             
+
+----------------------------------
+on a hardware level: (UART, softUART, tcp, etc)
+occupies themselves with detecting bits (start/stop bits, parity bits, and data bits ) 
+in order to assemble bytes.
+
+These bytes are one by one passed upward 
+via the callback function: rx/<protocol>::<protocol>DataReceive 
+where protocol can be one of: (ibus, sbus, crsf, fport, jetiexbus, sumh, sumd, xbus, spektrum).
+
+The <protocol>DataReceive functions uses the byte passed to it from the lower hardware level 
+to assemble a frame according to the protocol-rules.
+Once a complete frame has been assembled a flag gets set.
+
+from a task level: 
+if( RX_task.checkFunc )
+  RX_task.taskFunc;
+
+where .checkFunc and .taskFunc have previously been set up to:
+  .checkFunc = rx/rx::rxUpdateCheck
+  .taskFunc = fc/fc_tasks::taskUpdateRxMain
+
+the task RX with
+.checkFunc = rx/rx::rxUpdateCheck and .taskFunc = taskUpdateRxMain (setup in fc/fc_tasks)
+rxUpdateCheck calls rxRuntimeConfig.rcFrameStatusFn(&rxRuntimeConfig), 
+previously set up to point to one of: rx/<protocol>::<protocol>FrameStatus.
+if it returns true then run .taskFunc
+
+main
+    Init
+        rx/rx::rxInit {
+            rx/rx::serialRxInit {
+                switch (rxConfig->serialrx_provider)
+                    rx/<protocol>::<protocol>Init {
+                       setup:
+                         rxRuntimeConfig.rcFrameStatusFn = <protocol>FrameStatus
+                         rxRuntimeConfig.rcReadRawFn = <protocol>ReadRawRC
+                                               or in sbus case: sbusChannelsReadRawRC
+                         rxRuntimeConfig.channelData = &sbusInit::sbusChannelData;
+
+                       portConfig = io/serial::findSerialPortConfig( FUNCTION_RX_SERIAL )
+                       switch( portConfig->identifier )
+                         drivers/<hardware>::openSerialPort {
+                           stores the <protocol>DataReceive function 
+                           passed to it from <protocol>Init in <protocol>
+                         }
+                    }
+            }
+        }
+where <protocol> is one of the listed protocols mentioned previouly.
+where <hardware> is one of UART, softUART, TCP, USB, etc.
+
+######################## UART Initialization ###########################
+------------- This follows from serial port initialization -------------
+
+from drivers/serial_uart_stm32f4xx::serialUART
+drivers/io::IOGetByTag
+drivers/io::IOInit
+drivers/io::IOConfigGPIO( 
+    IOGetbyTag( 
+       uartdev->rx/tx = pSerialPinConfig->ioTagRx/Tx[ UARTDevice_e device = uartHardware[].device ] 
+    ), 
+    IOCFG_AF_PP/IOCFG_AF_OD 
+)
+
+-------------------------------------------------------------------------
+
+from drivers/io.h: 
+#define IO_TAG(pinid) DEFIO_TAG(pinid)
+
+from drivers/serial
+typedef struct serialPinConfig_s {
+    ioTag_t ioTagTx[SERIAL_PORT_MAX_INDEX];
+    ioTag_t ioTagRx[SERIAL_PORT_MAX_INDEX];
+    ioTag_t ioTagInverter[SERIAL_PORT_MAX_INDEX];
+} serialPinConfig_t;
+
+from drivers/serial_pinconfig:
+
+PG_REGISTER_WITH_RESET_FN(serialPinConfig_t, serialPinConfig, PG_SERIAL_PIN_CONFIG, 0);
+
+definitions used:
+UARTx_TX_PIN, UARTx_RX_PIN, INVERTER_PIN_UARTx (all set to P<port><pin>   port:A-G and pin:0-15) 
+USE_UARTx
+// where x: 1..8.
+// are defined in target/<pcb>/target.h
+
+// entries in serialDefaultPin where x is 1..8
+typedef struct serialDefaultPin_s {
+    serialPortIdentifier_e ident;
+    ioTag_t rxIO, txIO, inverterIO;
+} serialDefaultPin_t serialDefaultPin_t serialDefaultPin[] = {
+#ifdef USE_UARTx
+    { SERIAL_PORT_USARTx, IO_TAG(UARTx_RX_PIN), IO_TAG(UARTx_TX_PIN), IO_TAG(INVERTER_PIN_UARTx) },
+#endif
+
+void pgResetFn_serialPinConfig {
+  uses all entries in serialDefaultPin[] to initialize itself as follow:
+
+  const serialDefaultPin_t *defpin = &serialDefaultPin[index];
+  serialPinConfig->ioTagRx[SERIAL_PORT_IDENTIFIER_TO_INDEX(defpin->ident)] = defpin->rxIO;
+  serialPinConfig->ioTagTx[SERIAL_PORT_IDENTIFIER_TO_INDEX(defpin->ident)] = defpin->txIO;
+  serialPinConfig->ioTagInverter[SERIAL_PORT_IDENTIFIER_TO_INDEX(defpin->ident)] = defpin->inverterIO;
+}
+
+src/main/drivers/resource.h:64: #define RESOURCE_SOFT_OFFSET    10
+src/main/io/serial.h:76:        #define SERIAL_PORT_IDENTIFIER_TO_INDEX(x) (((x) <= SERIAL_PORT_USART8) ? (x) : (RESOURCE_SOFT_OFFSET + ((x) - SERIAL_PORT_SOFTSERIAL1)))
+
+------------------------------------------------------------------------------
+from drivers/serial_uart.h (this being with UARTDevice_e the only things declared in this file)
+typedef struct uartPort_s {
+    serialPort_t port;
+
+#if defined(STM32F7)
+    DMA_HandleTypeDef rxDMAHandle;
+    DMA_HandleTypeDef txDMAHandle;
+#endif
+#if defined(STM32F4) || defined(STM32F7)
+    DMA_Stream_TypeDef *rxDMAStream;
+    DMA_Stream_TypeDef *txDMAStream;
+    uint32_t rxDMAChannel;
+    uint32_t txDMAChannel;
+#else
+    DMA_Channel_TypeDef *rxDMAChannel;
+    DMA_Channel_TypeDef *txDMAChannel;
+#endif
+    uint32_t rxDMAIrq;
+    uint32_t txDMAIrq;
+
+    uint32_t rxDMAPos;
+
+    uint32_t txDMAPeripheralBaseAddr;
+    uint32_t rxDMAPeripheralBaseAddr;
+
+#ifdef USE_HAL_DRIVER
+    // All USARTs can also be used as UART, and we use them only as UART.
+    UART_HandleTypeDef Handle;
+#endif
+    USART_TypeDef *USARTx;
+    bool txDMAEmpty;
+} uartPort_t;
+
+from drivers/serial_uart_impl.h:
+typedef struct uartHardware_s {
+    UARTDevice_e device;    // XXX Not required for full allocation
+    USART_TypeDef* reg;
+#if defined(STM32F1) || defined(STM32F3)
+    DMA_Channel_TypeDef *txDMAChannel;
+    DMA_Channel_TypeDef *rxDMAChannel;
+#elif defined(STM32F4) || defined(STM32F7)
+    uint32_t DMAChannel;
+    DMA_Stream_TypeDef *txDMAStream;
+    DMA_Stream_TypeDef *rxDMAStream;
+#endif
+    ioTag_t rxPins[UARTHARDWARE_MAX_PINS];
+    ioTag_t txPins[UARTHARDWARE_MAX_PINS];
+#if defined(STM32F7)
+    uint32_t rcc_ahb1;
+    rccPeriphTag_t rcc_apb2;
+    rccPeriphTag_t rcc_apb1;
+#else
+    rccPeriphTag_t rcc;
+#endif
+    uint8_t af;
+#if defined(STM32F7)
+    uint8_t txIrq;
+    uint8_t rxIrq;
+#else
+    uint8_t irqn;
+#endif
+    uint8_t txPriority;
+    uint8_t rxPriority;
+} uartHardware_t;
+from drivers/serial_uart_stm32fyxx.c:
+uartHardware_t  uartHardware[];
+
+------------------------------------------------------------------------------
+
+from drivers/serial_uart_impl.h:
+typedef struct uartDevice_s {
+    uartPort_t port;                       // Gets initialized when uartOpen gets called
+    const uartHardware_t *hardware;        // Gets initialized by uartPinConfigure
+    ioTag_t rx;                            // Gets initialized by uartPinConfigure
+    ioTag_t tx;                            // Gets initialized by uartPinConfigure
+    volatile uint8_t rxBuffer[UART_RX_BUFFER_SIZE];
+    volatile uint8_t txBuffer[UART_TX_BUFFER_SIZE];
+} uartDevice_t;
+
+from drivers/serial_uart_pinconfig.c:
+uartDevice_t uartDevice[UARTDEV_COUNT];      // Only those configured in target.h
+uartDevice_t *uartDevmap[UARTDEV_COUNT_MAX]; // Full array
+
+void uartPinConfigure(const serialPinConfig_t *pSerialPinConfig) {
+
+  initializes uartDevice[]
+  by matching pins in serialPinConfig with pins in uartHardware[]::rxPins/txPins
+  and if match found associates
+    an uartDevice_t entry in: uartDevice[]
+    with a uartHardware_t entry in: drivers/serial_uart_stm32fyxx::uartHardware[] 
+    by means of uarTDevice[].hardware = uartHardware[]
+}
+
+// --------------------------------- UART runtime --------------------------------------
+
+drivers/serial_uart::UARTx_IRQHandler()
+  drivers/serial_uart_<mcu_version>::uartIrqHandler( uartPort_t* = &(uartDevmap[x]->port );
+
+where x is one of: UARTDevice_e
+
+--------------------------------------------------------------------------------
+in file: devices/serial_uart_<mcu_version>
+  uartHardware_t uartHardware[UARTDEV_COUNT] = {
+
+    #ifdef USE_UARTx
+    #endif
+  };
+  
+  uartPort_t* serialUART( UARTDevice_e );
+  void uartIrqHandler(uartPort_t *s)
+
+
+from drivers/serial_uart_stm32f4xx.c: (belongs in uart section)
+        .rxPins = { DEFIO_TAG_E(PA1), DEFIO_TAG_E(PC11), IO_TAG_NONE },
+        .txPins = { DEFIO_TAG_E(PA0), DEFIO_TAG_E(PC10), IO_TAG_NONE },
+
+
+// #####################################################################################
+
+setups-MBP:main paulmcdonald$ find . -type f | xargs grep findSerialPortConfig
+
+./blackbox/blackbox_io.c:portConfig = findSerialPortConfig(FUNCTION_BLACKBOX);
+./drivers/rangefinder/rangefinder_lidartf.c:    
+                         portConfig = findSerialPortConfig(FUNCTION_LIDAR_TF);
+./io/gps.c:              PortConfig = findSerialPortConfig(FUNCTION_GPS);
+./io/rcdevice.c:         portConfig = findSerialPortConfig(portID);
+./io/vtx_smartaudio.c:   portConfig = findSerialPortConfig(FUNCTION_VTX_SMARTAUDIO);
+./io/vtx_tramp.c:        portConfig = findSerialPortConfig(FUNCTION_VTX_TRAMP);
+
+./msp/msp_serial.c:      portConfig = findSerialPortConfig(FUNCTION_MSP);
+
+./rx/crsf.c:             portConfig = findSerialPortConfig(FUNCTION_RX_SERIAL);
+./rx/fport.c:            portConfig = findSerialPortConfig(FUNCTION_RX_SERIAL);
+./rx/ibus.c:             portConfig = findSerialPortConfig(FUNCTION_RX_SERIAL);
+./rx/jetiexbus.c:        portConfig = findSerialPortConfig(FUNCTION_RX_SERIAL);
+./rx/sbus.c:             portConfig = findSerialPortConfig(FUNCTION_RX_SERIAL);
+./rx/spektrum.c:         portConfig = findSerialPortConfig(FUNCTION_RX_SERIAL);
+./rx/spektrum.c:         portConfig = findSerialPortConfig(FUNCTION_RX_SERIAL);
+./rx/sumd.c:             portConfig = findSerialPortConfig(FUNCTION_RX_SERIAL);
+./rx/sumh.c:             portConfig = findSerialPortConfig(FUNCTION_RX_SERIAL);
+./rx/xbus.c:             portConfig = findSerialPortConfig(FUNCTION_RX_SERIAL);
+
+./sensors/esc_sensor.c:  portConfig = findSerialPortConfig(FUNCTION_ESC_SENSOR);
+./telemetry/frsky_hub.c: portConfig = findSerialPortConfig(FUNCTION_TELEMETRY_FRSKY_HUB);
+./telemetry/hott.c:      portConfig = findSerialPortConfig(FUNCTION_TELEMETRY_HOTT);
+./telemetry/ibus.c:      PortConfig = findSerialPortConfig(FUNCTION_TELEMETRY_IBUS);
+./telemetry/ltm.c:       portConfig = findSerialPortConfig(FUNCTION_TELEMETRY_LTM);
+./telemetry/mavlink.c:   portConfig = findSerialPortConfig(FUNCTION_TELEMETRY_MAVLINK);
+./telemetry/smartport.c: portConfig = findSerialPortConfig(FUNCTION_TELEMETRY_SMARTPORT);
+
+setups-MBP:main paulmcdonald$ find . -type f | xargs grep -w openSerialPort
+./blackbox/blackbox_io.c:                     blackboxPort = openSerialPort(portConfig->identifier,    FUNCTION_BLACKBOX,       NULL, NULL, baudRates[baudRateIndex],
+./drivers/rangefinder/rangefinder_lidartf.c:  tfSerialPort = openSerialPort(portConfig->identifier,    FUNCTION_LIDAR_TF,       NULL, NULL, 115200, MODE_RXTX, 0);
+./interface/cli.c:                         passThroughPort = openSerialPort(id,                        FUNCTION_NONE,           NULL, NULL,
+./io/gps.c:                                        gpsPort = openSerialPort(gpsPortConfig->identifier, FUNCTION_GPS,            NULL, NULL, baudRates[gpsInitData[gpsData.baudrateIndex].baudrateIndex], mode, SERIAL_NOT_INVERTED);
+./io/vtx_smartaudio.c:                     debugSerialPort = openSerialPort(DPRINTF_SERIAL_PORT,       FUNCTION_NONE, NULL,     NULL, 115200, MODE_RXTX, 0);
+./io/vtx_smartaudio.c:                smartAudioSerialPort = openSerialPort(portConfig->identifier,    FUNCTION_VTX_SMARTAUDIO, NULL, NULL, 4800, MODE_RXTX, portOptions);
+./io/vtx_tramp.c:                          trampSerialPort = openSerialPort(portConfig->identifier,    FUNCTION_VTX_TRAMP,      NULL, NULL, 9600, MODE_RXTX, portOptions);
+./sensors/esc_sensor.c:                      escSensorPort = openSerialPort(portConfig->identifier,    FUNCTION_ESC_SENSOR,     escSensorDataReceive, NULL, ESC_SENSOR_BAUDRATE, MODE_RX, options);
+./target/CRAZYFLIE2/serialrx.c:                 serialPort = openSerialPort(portConfig->identifier,
+
+setups-MBP:main paulmcdonald$ find . -type f | xargs grep "rxCallback *="
+./drivers/serial_escserial.c:     escSerial->port.rxCallback = callback;
+./drivers/serial_softserial.c:    softSerial->port.rxCallback = rxCallback;
+./drivers/serial_tcp.c:           s->port.rxCallback = rxCallback;
+./drivers/serial_uart_hal.c:      s->port.rxCallback = callback;
+./drivers/serial_uart_init.c:     s->port.rxCallback = rxCallback;
+./interface/cli.c:            passThroughPort->rxCallback = 0;
+./io/serial.c:                   serialPort->rxCallback = NULL;
+
+########################### RC RX ####################################
+
+c files: rx.c/.h, spectrum.c, sbus.c, sumd.c, sumh.c, xbus.c, ibus.c, jetiexbus.c, crsf.c, fport.c
+
+rx/rx::rxInit {
+  #ifdef USE_SERIAL_RX if( feature(FEATURE_RX_SERIAL)) serialRxInit(rxConfig(), &rxRuntimeConfig)
+  #ifdef USE_RX_MSP    if (feature(FEATURE_RX_MSP))    rxMspInit(rxConfig(), &rxRuntimeConfig);
+  #ifdef USE_RX_SPI    if (feature(FEATURE_RX_SPI))    rxSpiInit(rxConfig(), &rxRuntimeConfig);
+  #if defined(USE_PWM) || defined(USE_PPM)
+                       if (feature(FEATURE_RX_PPM) || feature(FEATURE_RX_PARALLEL_PWM)) rxPwmInit(rxConfig(), &rxRuntimeConfig);
+}
+
+from rx.h - enums used to initialize SERIALRX_PROVIDER 
+and therefore rxConfig.serialrx_provider:
+typedef enum {
+    SERIALRX_SRXL = 10,
+    SERIALRX_SPEKTRUM1024 = 0,
+    SERIALRX_SPEKTRUM2048 = 1,
+
+    SERIALRX_SBUS = 2,
+    SERIALRX_SUMD = 3,
+    SERIALRX_SUMH = 4,
+
+    SERIALRX_XBUS_MODE_B = 5,
+    SERIALRX_XBUS_MODE_B_RJ01 = 6,
+    SERIALRX_IBUS = 7,
+    SERIALRX_JETIEXBUS = 8,
+    SERIALRX_CRSF = 9,
+    SERIALRX_TARGET_CUSTOM = 11,
+    SERIALRX_FPORT = 12,
+} SerialRXType;
+used as follow:
+in file rx/rx procedure pgResetFn_rcConfig:
+  rxConfig.serialrx_provider = SERIALRX_PROVIDER
+in files: target/{BOARD}/target.h:
+  #define SERIALRX_PROVIDER   SERIALRX_xxxxxxx (mostly SERIALRX_SBUS)
+
+rx/rx::serialRxInit -> rxRuntimeConfig {
+  switch (rxConfig->serialrx_provider)
+    (note: serialrx_provider get initialized from SERIALRX_PROVIDER in pgResetFn_rxConfig - SERIALRX_PROVIDER specified in target/{BOARD}/target.h) {
+  #ifdef USE_SERIALRX_SPEKTRUM case SERIALRX_SRXL:
+                               case SERIALRX_SPEKTRUM1024:
+                               case SERIALRX_SPEKTRUM2048:       rx/spectrum::spektrumInit(rxConfig, rxRuntimeConfig); break;
+  #ifdef USE_SERIALRX_SBUS     case SERIALRX_SBUS:               rx/sbus::sbusInit(    rxConfig, rxRuntimeConfig); break;
+  #ifdef USE_SERIALRX_SUMD     case SERIALRX_SUMD:               rx/sumd::sumdInit(    rxConfig, rxRuntimeConfig); break;
+  #ifdef USE_SERIALRX_SUMH     case SERIALRX_SUMH:               rx/sumh::sumhInit(    rxConfig, rxRuntimeConfig); break;
+  #ifdef USE_SERIALRX_XBUS     case SERIALRX_XBUS_MODE_B:
+                               case SERIALRX_XBUS_MODE_B_RJ01:   rx/xbus::xBusInit(rxConfig, rxRuntimeConfig); break;
+  #ifdef USE_SERIALRX_IBUS     case SERIALRX_IBUS:               rx/ibus::ibusInit(    rxConfig, rxRuntimeConfig); break;
+  #ifdef USE_SERIALRX_JETIEXBUS case SERIALRX_JETIEXBUS:         rx/jetiexbus::jetiExBusInit(rxConfig, rxRuntimeConfig); break;
+  #ifdef USE_SERIALRX_CRSF     case SERIALRX_CRSF:               rx/crsf::crsfRxInit(  rxConfig, rxRuntimeConfig); break;
+  #ifdef USE_SERIALRX_TARGET_CUSTOM case SERIALRX_TARGET_CUSTOM: target/<PCB>/<file.c>::targetCustomSerialRxInit(rxConfig, rxRuntimeConfig); break;
+  #ifdef USE_SERIALRX_FPORT    case SERIALRX_FPORT:              rx/fport::fportRxInit(  rxConfig, rxRuntimeConfig); break;
+     { each of above ...Init function set the rxRuntimeConfig callback functions then calls:
+         findSerialPortConfig( FUNCTION_RX_SERIAL ) (io/serial) and 
+         openSerialPort( portConfig->identifier ) (io/serial)
+     }
+
+rx/msp::rxMspInit {
+  rxRuntimeConfig->rcReadRawFn = rx/msp::rxMspReadRawRC { return mspFrame[chan] }
+  rxRuntimeConfig->rcFrameStatusFn = rx/msp::rxMspFrameStatus {test flag rx/msp:rxMspFrameDone which is set by rxMspFrameReceive }
+}
+
+sbusInit (rx/sbus)
+        rxRuntimeConfig->channelData = &sbusInit::sbusChannelData;
+        rxRuntimeConfig->rcFrameStatusFn = sbusFrameStatus (rx/sbus)
+        sbusChannelsInit (rx/sbus_channels)
+                rxRuntimeConfig->rcReadRawFn = sbusChannelsReadRawRC
+        portConfig = io/serial::findSerialPortConfig( FUNCTION_RX_SERIAL )
+        io/serial::openSerialPort( portConfig->identifier, rxCallback = sbusDataReceive, rxCallbackData = sbusInit::sbusFrameData )
+
+fc/fc_tasks:: task {
+.taskName =  "RX"
+.checkFunc = rx/rx::rxUpdateCheck
+        rxRuntimeConfig.rcFrameStatusFn(&rxRuntimeConfig)
+
+.taskFunc = fc/fc_tasks::taskUpdateRxMain {
+        fc/fc_core::processRx  {
+                // mostly do mode switching?
+                rx/rx::calculateRxChannelsAndUpdateFailsafe
+                        rx/rx::readRxChannelsApplyRanges
+                                rxRuntimeConfig.channelData -> rxRuntimeConfig.rcReadRawFn -> rcRaw[]
+                                if channel < NON_AUX_CHANNEL_COUNT (first 4 channels: Roll(Aileron), Pitch(Elevator), Yaw(Rudder), Power(Throttle))
+                                  applyRxChannelRangeConfiguraton // constrain samples between: PWM_PULSE_MIN, PWM_PULSE_MAX
+                        rcRaw -> rx/rx::detectAndApplySignalLossBehaviour -> rcData[]
+                rcData[0-3] -> fc/rc_controls::processRcStickPositions {
+                        uses the position of the controller gymbal sticks (left(power/yaw) and right(pitch/roll))
+                        to arm/disarm drone or to do various configaration setting changes relating to:
+                        pid, camera, rate in ACCRO mode, etc
+                }
+                fc/rc_modes:updateActivatedModes {
+                  //does flight mode switching ACCRO, HORIZON, ANGLE, GPS, etc  
+                }
+        }
+        rcData[0..3] -> fc/fc_rc::updateRcCommands -> rcCommand[0..3] // update rcCommand for ROLL,PITCH,YAW,THROTTLE
+        updateArmingStatus
+}
+
+/* 
+void parseRcChannels(const char *input, rxConfig_t *rxConfig)
+input - indicates the order in which the T,A,E,R and aux inputs
+        received from the RC Rx is mapped to channels   
+rcChannelLetters (used in body of parseRcChannels - is a const string indicating the order in which betaflight expect
+                   the logical inputs (T,A,E,R and aux's) to be mapped to physical channels    
+Therefore the mapping of logical channels (T,A,E and R gymbals, switches and pots on RC Tx/Controller) 
+to physical channels (channels 1..16)  as received from the RC Rx                                                                                                            needs to change to the mapping required/expected by the betaflight software.
+
+After parseRcChannels has run rcmap is configured as follows:
+rcmap[expected_channel] = rawchannel
+
+for example: if in the channels received from the RC Rx 
+logical channel T (Throttle) is mapped to physical channel 1
+but the betaflight software wants it in physical channel 4
+the corresponding rcmap entry will contain: rcmap[4] = 1 
+
+rcmap is used in function: readRxChannelsApplyRanges as follows:
+if channel < RX_MAPPABLE_CHANNEL_COUNT
+  rcRaw[channel] = rxRuntimeConfig.rcReadRawFn(&rxRuntimeConfig, rxConfig()->rcmap[channel]);
+else
+  rcRaw[channel] = rxRuntimeConfig.rcReadRawFn(&rxRuntimeConfig, channel);
+
+*/
+
+  The following from target/common_fc_pre.h:
+  ------------------------------------------
+for conditional compilation:
+  #define USE_SERIALRX_SPEKTRUM   // SRXL, DSM2 and DSMX protocol
+  #define USE_SERIALRX_SBUS       // Frsky and Futaba receivers
+  #define USE_SERIALRX_IBUS       // FlySky and Turnigy receivers
+  #define USE_SERIALRX_CRSF       // Team Black Sheep Crossfire protocol
+  #define USE_SERIALRX_SUMD       // Graupner Hott protocol
+  #define USE_SERIALRX_SUMH       // Graupner legacy protocol
+  #define USE_SERIALRX_XBUS       // JR
+  #define USE_SERIALRX_FPORT      // FrSky FPort
+}
+
+#################### MSP ################################
+
+msp/interface::mspInit
+        interface/msp_box::initActiveBoxIds
+msp/msp_serial::mspSerialInit
+        msp/msp_serial::mspSerialAllocatePorts 
+                io/serial::findSerialPortConfig( FUNCTION_MSP )
+                io/serial::openSerialPort( portConfig->identifier )
+
+<hport> one of: (esc, softserial, tcp, uart, uart_hal, usb_vcp)
+.taskName = "SERIAL"
+.checkFunc = fc/fc_tasks::taskSerialCheck
+        mspSerialWaiting (msp/msp_serial)
+                drivers/serial::serialRxBytesWaiting( serialPort_t ) (drivers/serial)
+                        instance->vTable->serialTotalRxWaiting(instance); 
+                                implemented by: drivers/serial_<hport>::<hport>TotalRxBytesWaiting
+
+.taskFunc = fc/fc_tasks::taskHandleSerial {
+        if( cliMode ) {
+            interface/cli::cliProcess { implements a command interpreter and executes command entered at command-line }
+                    drivers/serial/serialRxBytesWaiting( serialPort_t ) {uses vtable}
+                    drivers/serial::serialRead {uses vtable}
+                    bufWriterFlush
+		        .writer() {pointing to: drivers/serial::serialWriteBufShim, which in turn executes: serialWriteBuf - which uses the vtable}
+            }
+        }
+        msp/msp_serial::mspSerialProcess( ,mspFcProcessCommand, mspFcProcessReply ) {
+                if( drivers/serial::serialRxBytesWaiting( serialPort_t ) ) {
+                            instance->vTable->serialTotalRxWaiting
+                                    implemented by: drivers/serial_<hport>::<hport>TotalRxBytesWaiting
+                    drivers/serial::serialRead
+                            instance->vTable->serialRead
+                                    implemented by: drivers/serial_<hport>::<hport>Read
+                    io/serial::waitForSerialPortToFinishTransmitting(mspPort->port) {
+                            drivers/serial::isSerialTransmitBufferEmpty(port)
+                                    instance->vTable->isSerialTransmitBufferEmpty
+                                            implemented by: drivers/serial_<hport>::is<hport>TransmitBufferEmpty
+                    }
+                    msp/msp_serial::mspSerialProcessReceivedCommand {
+                            interface/msp::mspFcProcessCommand( cmd )
+                                    if( interface/msp::mspCommonProcessOutCommand( cmd->cmd ) ) ;
+                                            common/streambuf::sbufWriteData
+                                    else if( msgProcessOutCommand( cmd->cmd ) )
+                                            common/streambuf::sbufWriteData
+                                    else if( cmd->cmd == MSG_SET_4WAY_IF ) mspFc4waySerialCommand;
+                                        common/streambuf::sbufWrite...
+                                    else if( cmd->cmd == MSP_DATAFLASH_READ ) mspFcDataFlashReadCommand;
+                                    else mspCommonProcessInCommand( cmd->cmd ) {
+                                       switch( cmd->cmd ) {
+                                         case xxx: // sets various xxxConfigMutable configurations
+                                           common/streambuf::sbufRead...
+                                         default: 
+                                           return mspProcessInCommand( cmd->cmd ) {
+                                             switch( cmd->cmd ) {
+                                               case xxx: // sets various xxxConfigMutable configurations
+                                               case MSP_SET_RAW_RC: rxMspFrameReceive( frame, channelcount ) (rx/msp) {
+                                                                      Sets flag rx/msp:rxMspFrameDone
+                                                                    }
+                                               default return MSP_RESULT_ERROR
+                                             }
+                                         }
+                                       }
+                                    }
+                            if reply necessary
+                               common/streambuf::sbufSwitchToReader
+                               msp/msp_serial::mspSerialEncode
+                    
+                    msp/msp_serial::mspSerialProcessReceivedData
+                    msp/msp_serial::mspSerialProcessReceivedReply
+                            interface/msp::mspFcProcessReply
+                }
+        }
+        else {
+             mspProcessPendingRequest
+                 interface/cli::cliEnter { cliMode = 1 }
+        }
+}
+
+#################### TELEMETRY ################################
+
+task {
+  .taskName = "TELEMETRY"
+  .taskFunc = fc/fc_task::taskTelemetry {
+      telemetry/telemetry::telemetryProcess {
+         #ifdef USE_TELEMETRY_FRSKY_HUB    handleFrSkyHubTelemetry(currentTime);
+         #ifdef USE_TELEMETRY_HOTT         handleHoTTTelemetry(currentTime);
+         #ifdef USE_TELEMETRY_SMARTPORT    handleSmartPortTelemetry() {
+              while( serialRxBytesWaiting( serialPort_t )  (drivers/serial) {
+                c = serialRead( port )
+                smartPortDataReceive( c ) { assembles a complete smartport packet }
+              }
+              processSmartPortTelemetry( port ) (telemetry/smartport) {
+	        smartPortSendPackage (telemetry/smartport)
+		    smartPortWriteFrame pointing to one of:
+                        smartPortWriteFrameSerial or smartPortWriteFrameInternal (telemetry/smartport)
+                            smartPortSendByte (telemetry/smartport)
+                                drivers/serial::serialWrite( serialPort )
+                                    {uses vtable to write to a uart, usb/vcp, tcp/ip, etc}
+                         or set by an external module:
+                             rx/cc2500_frsky_x.c:   telemetryEnabled = initSmartPortTelemetryExternal(frSkyXTelemetryWriteFrame);
+                             rx/fport.c:            telemetryEnabled = initSmartPortTelemetryExternal(smartPortWriteFrameFport);
+              }
+         }
+         #ifdef USE_TELEMETRY_LTM          handleLtmTelemetry();
+         #ifdef USE_TELEMETRY_JETIEXBUS    handleJetiExBusTelemetry();
+         #ifdef USE_TELEMETRY_MAVLINK      handleMAVLinkTelemetry();
+         #ifdef USE_TELEMETRY_CRSF         handleCrsfTelemetry(currentTime);
+         #ifdef USE_TELEMETRY_SRXL         handleSrxlTelemetry(currentTime);
+         #ifdef USE_TELEMETRY_IBUS         handleIbusTelemetry();
+      }
+  }
+}
+
+init (fc/fc_init)
+void telemetryInit(void) (telemetry/telemetry)
+{
+    #ifdef USE_TELEMETRY_FRSKY_HUB    initFrSkyHubTelemetry();
+    #ifdef USE_TELEMETRY_HOTT         initHoTTTelemetry();
+    #ifdef USE_TELEMETRY_SMARTPORT    initSmartPortTelemetry();
+    #ifdef USE_TELEMETRY_IBUS         initIbusTelemetry();
+    #ifdef USE_TELEMETRY_LTM          initLtmTelemetry();
+    #ifdef USE_TELEMETRY_MAVLINK      initMAVLinkTelemetry(); {
+      for: frsky_hub.c, hott.c, ibus.c, ltm.c, mavlink.c, smartport.c each individual init<telemetryproto>Telemetry function calls:
+      io/serial::findSerialPortConfig( FUNCTION_TELEMETRY_SMARTPORT ) and io/serial::determinePortSharing
+    }
+
+    #ifdef USE_TELEMETRY_CRSF         initCrsfTelemetry();
+    #ifdef USE_TELEMETRY_SRXL         initSrxlTelemetry(); {
+        above two initxxxxTelemetry functions call rx/crsf::crsfRxIsActive and rx/spektrum::srxlRxIsActive 
+        to determine whether there is an open tx/rx port.
+    }
+
+    #ifdef USE_TELEMETRY_JETIEXBUS    initJetiExBusTelemetry();
+    #if defined(USE_MSP_OVER_TELEMETRY) initSharedMsp();    initCrsfMspBuffer();
+
+    telemetryCheckState() {
+       #ifdef USE_TELEMETRY_FRSKY_HUB    checkFrSkyHubTelemetryState();
+       #ifdef USE_TELEMETRY_HOTT         checkHoTTTelemetryState();
+       #ifdef USE_TELEMETRY_SMARTPORT    checkSmartPortTelemetryState() 
+       #ifdef USE_TELEMETRY_LTM          checkLtmTelemetryState();
+       #ifdef USE_TELEMETRY_MAVLINK      checkMAVLinkTelemetryState();
+       #ifdef USE_TELEMETRY_IBUS         checkIbusTelemetryState(); {
+           all of the above check...TelemetryState functions call:
+               openSerialPort as follows:
+setups-MacBook-Pro:main paulmcdonald$ find telemetry -type f | xargs grep -w openSerialPort
+telemetry/frsky_hub.c:        openSerialPort(portConfig->identifier,   FUNCTION_TELEMETRY_FRSKY_HUB, NULL, NULL, 
+telemetry/hott.c:             openSerialPort(portConfig->identifier,   FUNCTION_TELEMETRY_HOTT, NULL, NULL, 
+telemetry/hott.c:             openSerialPort(portConfig->identifier,   FUNCTION_TELEMETRY_HOTT, NULL, NULL, 
+telemetry/ibus.c:             openSerialPort(PortConfig->identifier,   FUNCTION_TELEMETRY_IBUS, NULL, NULL, 
+telemetry/ltm.c:              openSerialPort(portConfig->identifier,   FUNCTION_TELEMETRY_LTM, NULL, NULL, 
+telemetry/mavlink.c:          openSerialPort(portConfig->identifier,   FUNCTION_TELEMETRY_MAVLINK, NULL, NULL, 
+telemetry/smartport.c:        openSerialPort(portConfig->identifier,   FUNCTION_TELEMETRY_SMARTPORT, NULL, NULL, 
+       }
+
+       #ifdef USE_TELEMETRY_JETIEXBUS    checkJetiExBusTelemetryState();
+       #ifdef USE_TELEMETRY_CRSF         checkCrsfTelemetryState();
+       #ifdef USE_TELEMETRY_SRXL         checkSrxlTelemetryState();
+    }
+}
+
+##################  RX SPI #####################
+
+The RX SPI protocol is selected by rxConfig->rx_spi_protocol of type: rx_spi_protocol_e.
+spirxprotofiles in directory rx: (
+  cc2500_frsky_shared, cc2500_frsky_d, cc2500_frsky_x,
+  nrf24_cx10, nrf24_inav, nrf24_syma, nrf24_h8_3d, nrf24_kn, nrf24_v202
+  flysky (which should have been: a7105_flysky)
+  file-naming-convention: <2.4GHzChip>_<rxprotocol>
+)
+spi rx modules <spirxprotomodules>: (
+  frSkySpi, (using CC2500 Transceiver chip)
+  v202Nrf24, symaNrf24, cx10Nrf24, h8_3dNrf24, knNrf24, inavNrf24, (all using nRF24 Transceiver chip)
+  flySky   (using A7105 Transceiver chip)
+)
+
+rx/rx_spi::rxSpiInit {
+    if( rxSpiSetProtocol( rxConfig->rx_spi_protocol ) {
+          switch( rxConfig->rx_spi_protocol ) {
+            protocolInit = rx/<spirxproto>:<spirxproto>Init
+            protocolDataReceived = rx/<spirxproto>:<spirxproto>DataReceived
+            protocolSetRcDataFromPayload = rx/<spirxproto>:<spirxproto>SetRcDataFromPayload
+          }
+        }
+    ) 
+    ret = protocolInit(rxConfig, rxRuntimeConfig);
+
+    rxRuntimeConfig->rcFrameStatusFn = rx/rx_spi::rxSpiFrameStatus {
+                                         protocolDataReceived() // which has been set in rx/rx_spi::rxSpiInit
+                                       }
+    rxRuntimeConfig->rcReadRawFn     = rx/rx_spi::rxSpiReadRawRC {
+                                         protocolSetRcDataFromPayload() // which has been set in rx/rx_spi::rxSpiInit
+                                       }
+}
+
+for FrSky:
+rx/cc2500_frsky_shared
+rx/cc2500_frsky_d
+rx/cc2500_frsky_x
+drivers/rx/rx_cc2500: // implements rxSpiRead/Write procedures (defined in rx_spi) in cc2500... procedures (defined in rx_c2500)
+        cc2500.... // All implemented by drivers/rx/rx_spi
+    drivers/rx/rx_spi:
+      rxSpiWriteByte
+      rxSpiWriteCommand
+      rxSpiWriteCommandMulti
+      rxSpiReadCommand
+      rxSpiReadCommandMulti
+        rxSpiTransferByte
+          drivers/bus_spi:spiTransferByte or
+          drivers/bus_spi_soft:softSpiTransferByte
+
+##################################  Making/Building  ##################################
+
+Downloaded arm cross-compiler from:
+https://developer.arm.com/open-source/gnu-toolchain/gnu-rm/downloads
+
+Installed it at:
+/Users/paulmcdonald/Workspace/Technical/Drones/gcc-arm-none-eabi-7-2017-q4-major
+
+and added following path to $PATH in ~/.profile:
+/Users/paulmcdonald/Workspace/Technical/Drones/gcc-arm-none-eabi-7-2017-q4-major/bin
+
+Then built betaflight with:
+cd betaflight (home directory: /Users/paulmcdonald/Workspace/Technical/Drones/FC_AI_Navigation/betaflight)
+make TARGET=NAZE
+or
+make TARGET=
+
+To get a list of commands which will execute when building do:
+
+>make -n TARGET=...
+
+I have writtten an utility  to parse this file. Run:
+> awk -f parser.awk < <output_of_make_-n> > make_parsed
+
+-------------------- help on cross-compiler make ---------------------------
+
+To get help on the build process for betaflight:
+
+>make help
+
+when linking (final step of build) important file is: target/link/stm32_flash_f405.ld
+it controls for instance memory segments etc (at least when building KAKUTEF4).
+
+after build information about location of symbols available in:
+Betaflight_home/obj/main/betaflight_<PCB>.map 
+basically there is a one to one relationship between what is provided in stm32_flash_f405.ld and stm32_flash_split.ld and the .map file.
+
+To get information on the arm compiler:
+cd ~paulmcdonald/Workspace/Technical/Drones/gcc-arm-none-eabi-7-2017-q4-major/share/doc/gcc-arm-none-eabi/pdf
+and 
+> Open document in pdf reader
+example.
+>Open gcc/gcc.pdf
+or
+cd cd ~paulmcdonald/Workspace/Technical/Drones/gcc-arm-none-eabi-7-2017-q4-major/share/doc/gcc-arm-none-eabi/html
+and 
+> Open document in web browser.
+
+--------------- Make process -------------------
+
+make/system-id.mk
+  detects on what OS the build is being carried out( windows, linux, macosx, MinGW, Cygwin )
+  and sets OSFAMILY accordingly.
+  also sets: ARCHFAMILY 
+  and one of:
+  LINUX, MACOSX, WINDOWS (WINDOWS could be in combination with one of: MINGW or CYGWIN)
+
+every target/<pcb>/target.mk adds its $TARGET definition (entered on command line to make) to one of: 
+F1_TARGETS, F3_TARGETS, 
+F405_TARGETS, F411_TARGETS, F446_TARGETS,                                       ...1 
+F7X2RE_TARGETS, F7X5XE_TARGETS, F7X5XG_TARGETS, F7X5XI_TARGETS, F7X6XG_TARGETS, ...2
+SITL_TARGETS 
+
+In file: make/targets.mk
+First: F4_TARGETS gets set to ...1
+  and: F7_TARGETS gets set to ...2
+
+TARGET_MCU gets set to one of STM32F1/STM32F3/STM32F4/STM32F7/SITL
+
+File: make/mcu/$(TARGET_MCU).mk then gets included in $HOME/Makefile
+  In which lots of things get defined including (for the case of KAKUTEF4):
+    STM32F40_41xxx and STM32F405xx
+
+--------------- KAKUTEF4 V2 -------------------
+
+In order to build for KAKUTEF4 V2 the compiler directive KAKUTEF4V2 must be defined (used in target/KAKUTEF4/target.h).
+Either the target.h file can be modified and the line: #define KADUTEF4V2 can be added 
+or
+(which I have done)
+the Makefile in the betaflight home directory can be modified by adding the keyword: "override" where CFLAGS is defined in Makefile
+and then when running make the following command line can be used:
+>make TARGET=KAKUTEF4 CFLAGS=-DKAKUTEF4V2
+
+##################################  Flashing ################################
+
+Using Betaflight Configurator:
+------------------------------
+
+To flash the KAKUTE V2 PCB - do following:
+    0) Connect target PCB with USB cable to macbook.
+    1) Startup Betaflight Configurator on OSX
+    2) Goto Command Line Interface: CLI
+    3) At command line enter: bl
+    4) choose right PCB and either use local hex file (Made/Built locally) or download online from GitHub Betaflight
+    5) Flash the PCB.
+
+Using dfu-util:
+---------------
+
+First the FC board has been put in bootloader mode by:
+  i)   connecting it to the MacBook via USB cable, 
+  ii)  starting up Betaflight Configurator and then 
+  iii) from cli executing command: bl <cr>
+  iv)  then quit Betaflight Configurator.
+
+Or by holding in the Boot Button on Holybro-KAKUTEF4 pcb - only problem is: I can't find the button on pcb.
+
+From Macbook Command Line execute: 
+>dfu-util -l
+
+dfu-util 0.9
+
+Copyright 2005-2009 Weston Schmidt, Harald Welte and OpenMoko Inc.
+Copyright 2010-2016 Tormod Volden and Stefan Schmidt
+This program is Free Software and has ABSOLUTELY NO WARRANTY
+Please report bugs to http://sourceforge.net/p/dfu-util/tickets/
+
+Deducing device DFU version from functional descriptor length
+Found Runtime: [05ac:821a] ver=0042, devnum=8, cfg=1, intf=3, path="250-1.1.3", alt=0, name="UNKNOWN", serial="UNKNOWN"
+Found DFU: [0483:df11] ver=2200, devnum=6, cfg=1, intf=0, path="250-1.3", alt=3, name="@Device Feature/0xFFFF0000/01*004 e", serial="336930663536"
+Found DFU: [0483:df11] ver=2200, devnum=6, cfg=1, intf=0, path="250-1.3", alt=2, name="@OTP Memory /0x1FFF7800/01*512 e,01*016 e", serial="336930663536"
+Found DFU: [0483:df11] ver=2200, devnum=6, cfg=1, intf=0, path="250-1.3", alt=1, name="@Option Bytes  /0x1FFFC000/01*016 e", serial="336930663536"
+Found DFU: [0483:df11] ver=2200, devnum=6, cfg=1, intf=0, path="250-1.3", alt=0, name="@Internal Flash  /0x08000000/04*016Kg,01*064Kg,07*128Kg", serial="336930663536"
+
+from:  0800 0000
+size:  0808 8000
+
+FLASH:		0800 0000
+size:       	     4000  (16k)
+
+
+FLASH_CONFIG	0800 4000
+size:                4000  (16k - but no code)
+
+FLASH1:		0800 8000
+size:		   8 0000  (512k)
+  
+To upload (save) the existing FC software - execute (after replacing <FLASH_size> and <FLASH1_size> - the 3rd option might be the best though):
+
+dfu-util -device 05ac:821a,0483:df11 -a 0 -U flash1.bin -s 0x08000000:<FLASH_size>
+dfu-util -device 05ac:821a,0483:df11 -a 0 -U flash2.bin -s 0x08008000:<FLASH1_size>
+dfu-util -device 05ac:821a,0483:df11 -a 0 -U flash.bin -s 0x08000000:0x573E8|<FLASH_size + FLASH1_size
+
+Then to convert the .bin file (binary file) to a .hex file - execute: 
+
+>arm-none-eabi-objcopy -I binary -O ihex flash1.bin flash1.hex
+>arm-none-eabi-objcopy -I binary -O ihex flash2.bin flash2.hex
+
+Adding: "--set-start 0" adds a 05 record-type to .hex file
+Adding: "--long-section-names enable --change-addresses 0x8000000" add 04 record_types to .hex file.
+
+arm-none-eabi-objcopy -I binary -O ihex --set-start 0 --long-section-names enable --change-addresses 0x8000000 flash.bin flash.hex
+
+to flash/download:
+
+dfu-util -device 05ac:821a,0483:df11 -a 0 -s 0x08000000:leave -D betaflight_2.9.1_SPRACINGF3EVO.bin
+
+#############################################################################
+########## Gyro and Accelerometer ################
+following in (drivers/bus_spi_stdperiph):
+spiHardware_t
+spiDevice_t 
+spiDevice_t spiDevice[SPIDEV_COUNT] 
+
+accDev_t, gyroDev_t (drivers/accgyro/accgyro.h)
+
+          gyroInit (sensors/gyro)
+                gyroInitSensor (sensors/gyro) {
+                        mpuDetect( gyroSensor->gyroDev ) (drivers/accgyro/accgyro_mpu)
+                                detectSPISensorsAndUpdateDetectionResult (driver/accgyro/accgyro_mpu)
+                                        spiBusSetInstance (drivers/bus_spi)
+                                        icm20689SpiDetect (drivers/accgyro/accgyro_spi_icm20689)
+                                                icm20689SpiInit (drivers/accgyro/accgyro_spi_icm20689)
+                        gyroDetect( gyroSensor->gyroDev ) (sensors/gyro)
+                                icm20689SpiGyroDetect (drivers/accgyro/accgyro_spi_icm20689)
+                                        gyro->initFn = icm20689GyroInit {
+                                                          mpuGyroInit (drivers/accgyro/accgyro_mpu)
+                                                                spiSetDivisor, spiBusWriteRegister (drivers/bus_spi)
+                                                       }
+                                        gyro->readFn = mpuGyroReadSPI (drivers/accgyro/accgyro_mpu)
+                                        gyro->scale = ...
+                        gyroSensor->gyroDev->initFn();
+                        gyroInitSensorFilters
+                }
+
+          accInit (sensors/acceleration)
+                accDetect (sensors/acceleration)
+                        icm20689SpiAccDetect
+                                acc->initFn = icm20689AccInit
+                                acc->readFn = mpuAccRead (drivers/accgyro/accgyro_mpu)
+
+
+gyroUpdate
+        gyroUpdateSensor
+                gyro->ReadFn() {which has been set during gyro initialization}
+
+accUpdate
+        acc->readFn() (which has been set during accelerometer initialization)
+
+
+mpuDetect (drivers/accgyro/accgyro_mpu)
+  detectSPISensorsAndUpdateDetectionResult (drivers/accgyro/accgyro_mpu)
+
+############################  OSC CMS ################################
+
+init (fc/fc_init)
+  osdDisplayPort = max7456DisplayPortInit(vcdProfile()) (io/displayport_max7456)
+    drivers/display::displayInit { sets vtable }
+    drivers/max7456::max7456Init
+    resync
+  osdInit ( osdDisplayPort )
+
+task {
+  .taskName = "OSD"
+  .taskFunc = io/osd::osdUpdate {
+     io/osd::osdRefresh
+         osdUpdateStats (io/osd)
+	 osdShowStats (io/osd)
+           drivers/display::displayWrite {uses vTable}
+              vtable->writeString {displayport_max7456::writeString}
+                   max7456Write
+
+     drivers/display::displayDrawScreen
+        vtable->drawScreen (pointing to io/displayport_max7456::drawScrren)
+	    drivers/max7456::max7456DrawScreen
+                drivers/bus_spi::spiTransfer
+  }
+}
+
+cms/cms.c
+io/osd.c
+  drivers/display.c {
+    uses vtable to call one of functions in io/displayport_xxxx.c
+  }
+    io/displayport_crsf
+    io/displayport_max7456
+
+################### RCDevice - Runcam Camera Control ##########################
+
+task {
+  .taskName = "RCDEVICE"
+  .taskFunc = io/rcdevice_cam::rcdeviceUpdate {
+     io/rcdevice_cam::rcdeviceCameraControlProcess
+         io/rcdevice::runcamDeviceSimulateCameraButton
+     io/rcdevice_cam::rcdevice5KeySimulationProcess
+         io/rcdevice::runcamDeviceSimulate5KeyOSDCableButtonPress
+         io/rcdevice::runcamDeviceOpen5KeyOSDCableConnection
+         io/rcdevice::runcamDeviceClose5KeyOSDCableConnection {
+             // all of the above more or less call the following:
+             runcamDeviceSendRequestAndWaitingResp
+                 runcamDeviceReceivePacket
+         }
+  }
+}
+
+init (fc/fc_init)
+    io/rcdevice_cam::rcdeviceInit
+        io/rcdevice::runcamDeviceInit
+            io/serial::findSerialPortConfig( FUNCTION_RCDEVICE )
+            io/serial::openSerialPort
+
+############################ GPIO (ports and pins) ############################
+
+c files involved:
+  io.c/.h
+other files involved: 
+  target.h, io_types.h, io_impl.h, io_dev.h, resource.h,
+  io_def_generated.h, src/utils/def_generated.pl, 
+  rcc.h, utils.h
+
+definitions needed in target.h:
+  TARGET_IO_PORTx
+
+src/main/drivers/io_types.h:31: #define IO_TAG_NONE 0
+
+------------------------ the 3 types used in GPIO: ioTag_t, IO_t and ioRec_s ------------------------------------
+
+everywhere where reference is made to: pinid - is meant a string of form: "Pxy"  where where x: A..G (port) and y: 0..15 (pin index)
+only pinid's are allowed in target.h files to specify a port-pin
+and specified port-pin's must not clash with TARGET_IO_PORTx values also in target.h
+
+---------------- ioTag_t ---------------
+
+src/main/drivers/io_types.h:27: typedef uint8_t ioTag_t;  // range from 16 for PA0, 32 for PB0 to 127 for PG15
+
+---------------- IO_t and ioRec_t ---------------
+
+IO_t and ioRec_t are closely related: IO_t is nothing but a pointer to an ioRec_t
+
+src/main/drivers/io_types.h:28: typedef void* IO_t;       // type specifying IO pin. Currently ioRec_t pointer, but this may change
+
+from drivers/io_impl.h:
+typedef struct ioRec_s {
+    GPIO_TypeDef *gpio;   // set to:  (GPIO_TypeDef *)(GPIOA_BASE + (port << 10));   //  ports (0..DEFIO_PORT_USED_COUNT) are 0x400 apart
+                          //          (points into internal FLASH of STM32) (used for STM32 lib calls.
+    uint16_t pin;         // bitmapped pin therefore value: b0000001 - pin 1, value: b000010 - pin 2, etc
+    resourceOwner_e owner; 
+    uint8_t index;        // some index for resources owned by resourceOwner_e ??
+} ioRec_t;
+ioRec_t drivers/io::ioRecs[ DEFIO_IO_USED_COUNT ]
+
+drivers/resource:
+  typedef enum { OWNER_FREE, OWNER_..., ..., OWNER_TOTAL_COUNT } resourceOwner_e ;
+  const char * const ownerNames[OWNER_TOTAL_COUNT] = { "FREE", ... };
+
+---------- Initialization of ioRecs -------------
+
+static const uint16_t ioDefUsedMask[DEFIO_PORT_USED_COUNT] = { DEFIO_PORT_USED_LIST };
+static const uint8_t  ioDefUsedOffset[DEFIO_PORT_USED_COUNT] = { DEFIO_PORT_OFFSET_LIST};
+
+init
+  IOInitGlobal {
+    initializes ioRecs[] from: 
+    uint16_t drivers/io::ioDefUsedMask[DEFIO_PORT_USED_COUNT] = { DEFIO_PORT_USED_LIST };
+    more specifically initializes fields: .gpio and .pin of ioRec_t
+  }
+
+fields .owner and .index of ioRec_t in ioRecs[] managed by functions:
+drivers/io::IOInit, IORelease, IOGetOwner
+
+other ioRec_t management functions: 
+all functions defined in drivers/io like: IO_...:
+ioRec_t*      IO_Rec(IO_t io);
+GPIO_TypeDef* IO_GPIO(IO_t io);
+uint16_t      IO_Pin(IO_t io);
+// port index, GPIOA == 0
+int           IO_GPIOPortIdx(IO_t io);
+
+------------------------------------------------------------------------
+#define BIT(x) (1 << x)
+
+from drivers/io_dev.h:
+----------------------
+// This is the resolved form of how to produce an ioTag_t. 
+// Therefore all of: 
+// DEFIO_TAG__Pxy, DEFIO_TAG_E__Pxy,    (defined in io_dev_generated.h), 
+// IO_TAG( Pxy ),                       (defined in io.h
+// DEFIO_TAG( Pxy ), DEFIO_E_TAG( Pxy ) (defined in io_dev.h)
+// eventually resolves to this:
+
+#define DEFIO_TAG_MAKE(gpioid, pin) ((ioTag_t)((((gpioid) + 1) << 4) | (pin)))
+
+// get port_index (0..8) or pin_index (0..15) from ioTag_t
+#define DEFIO_TAG_GPIOID(tag) (((tag) >> 4) - 1)  // get port_index
+#define DEFIO_TAG_PIN(tag) ((tag) & 0x0f)         // get pin_index
+
+// get pointer to ioRec by index
+// This is the resolved form of how to produce an ioRecs*
+#define DEFIO_REC_INDEXED(idx) (ioRecs + (idx))
+
+from drivers/io_dev_generated.h  (rc/utils/def_generated.pl  generates: drivers/io_def_generated.h {must still investigate})
+--------------------------------------------------------------------------------------------------
+// DEFIO_PORT_<port>_USED_MASK is bitmask of used pins on target
+// DEFIO_PORT_<port>_USED_COUNT is count of used pins on target
+
+#if defined(TARGET_IO_PORTx)
+# define DEFIO_PORT_x_USED_MASK TARGET_IO_PORTx
+# define DEFIO_PORT_x_USED_COUNT BITCOUNT(DEFIO_PORT_x_USED_MASK)
+#else
+# define DEFIO_PORT_x_USED_MASK 0
+# define DEFIO_PORT_x_USED_COUNT 0
+#endif
+//DEFIO_PORT_A_OFFSET, DEFIO_PORT_B_OFFSET, DEFIO_PORT_C_OFFSET, DEFIO_PORT_D_OFFSET, DEFIO_PORT_E_OFFSET, DEFIO_PORT_F_OFFSET, DEFIO_PORT_G_OFFSET
+#define DEFIO_PORT_x_OFFSET (DEFIO_PORT_A_USED_COUNT+...DEFIO_PORT_(x-1)_USED_COUNT
+
+/* in above x is: A,B,...G */
+
+// DEFIO_GPIOID__<port> maps to port index
+#define DEFIO_GPIOID__A 0
+#define DEFIO_GPIOID__B 1
+#define DEFIO_GPIOID__C 2
+#define DEFIO_GPIOID__D 3
+#define DEFIO_GPIOID__E 4
+#define DEFIO_GPIOID__F 5
+#define DEFIO_GPIOID__G 6
+
+// DEFIO_TAG__P<port><pin> will expand to TAG if defined for target, error is triggered otherwise
+// DEFIO_TAG_E__P<port><pin> will expand to TAG if defined, to NONE otherwise (usefull for tables that are CPU-specific)
+// DEFIO_REC__P<port><pin> will expand to ioRec* (using DEFIO_REC_INDEX(idx))
+
+#if DEFIO_PORT_x_USED_MASK & BIT(y)
+# define DEFIO_TAG__Pxy   DEFIO_TAG_MAKE(DEFIO_GPIOID__x, y)
+# define DEFIO_TAG_E__Pxy DEFIO_TAG_MAKE(DEFIO_GPIOID__x, y)
+# define DEFIO_REC__Pxy   DEFIO_REC_INDEXED(BITCOUNT(DEFIO_PORT_x_USED_MASK & (BIT(y) - 1)) + 0) + (previously defined DEFIO_PORT_a_USED_COUNT where a<x)
+#else
+# define DEFIO_TAG__Pxy   defio_error_Pxy_is_not_supported_on_TARGET
+# define DEFIO_TAG_E__Pxy DEFIO_TAG_E__NONE
+# define DEFIO_REC__Pxy   defio_error_Pxy_is_not_supported_on_TARGET
+#endif
+/* where x: A,B...G  and y: 0..15
+
+TARGET_IO_PORTx defined in target/<PCB>/target.h and indicates pin mapping of port (if all pins used: 0xFFFF)
+#if !defined DEFIO_PORT_USED_LIST && DEFIO_PORT_x_USED_COUNT > 0   // (x,y) = (G,7),(F,6),....(A,1)
+# define DEFIO_PORT_USED_COUNT y
+# define DEFIO_PORT_USED_LIST DEFIO_PORT_A_USED_MASK,...DEFIO_PORT_x_USED_MASK
+# define DEFIO_PORT_OFFSET_LIST DEFIO_PORT_A_OFFSET,...DEFIO_PORT_x_OFFSET
+#endif
+
+---------------------------------------------------------------------------------------------------
+
+from drivers/io_dev.h:  (these only work in conjunction with definitions in io_def_generated.h)
+#define DEFIO_TAG(pinid) CONCAT(DEFIO_TAG__, pinid)
+#define DEFIO_TAG__NONE 0
+#define DEFIO_TAG_E(pinid) CONCAT(DEFIO_TAG_E__, pinid)
+#define DEFIO_TAG_E__NONE 0
+
+#define DEFIO_REC(pinid) CONCAT(DEFIO_REC__, pinid)
+#define DEFIO_IO(pinid) (IO_t)DEFIO_REC(pinid)
+
+from drivers/io.h:
+// expand pinid  to ioTag_t
+// here pinid would be: Pxy where x = A..G (port) and y = 00..15 (pin)
+#define IO_TAG(pinid) DEFIO_TAG(pinid)
+
+/* therefore:
+   pinid  : ioTag_t
+   -----  : -------
+   PA00-15 : 16-31
+   PB00-15 : 32-47
+   PC00-15 : 48-63
+   etc
+   PG00-15 : 112-127
+*/
+
+Therefore:
+examples:
+  ioTag_t  pin_tag;
+  IO_T     pin_io;
+  ioRec_t* pin_rec
+
+  //to make ioTag_t from pinid:
+                                        // (following line not recommended since not checking against TARGET_IO_PORTx)
+  pin_tag = DEFIO_TAG_MAKE( x, y );     // needs to include: io_def.h 
+
+  pin_tag = IO_TAG( Pxy );              // needs to include: io.h, io_def.h which includes( target.h and io_def_generated.h )
+  pin_tag = DEFIO_TAG( Pxy );           // needs to include: io_def.h which includes( target.h, io_def_generated.h )
+  pin_tag = DEFIO_E_TAG( Pxy );         // needs to include: io_def.h which includes( target.h and io_def_generated.h )
+  // where IO_TAG is defined in terms of DEFIO_TAG -- therefore the same
+
+  pin_tag = DEFIO_TAG__Pxy;             // needs to include: target.h, io_def_generated.h
+  pin_tag = DEFIO_TAG_E__Pxy            // needs to include: target.h, io_def_generated.h
+
+  // to make ioRec_t* from pinid:
+  pin_rec = DEFIO_REC( Pxy );
+
+  //to make IO_t from pinid:
+  pin_io =  DEFIO_IO( Pxy );
+
+  //to programmatically get IO_t from ioTag_t:
+  //IO_t serial/io::IOGetByTag( ioTag_t );
+  pin_io = IOGetByTag( pin_tag );
+
+  //to programmatically get ioRec_t* from IO_t - but this in not recommended/necessary (at moment only involves a cast from IO_t to ioRec_t*) :
+  //ioRec_t* serial/io::IO_Rec( IO_t )
+  pin_rec = IO_Rec( pin_io );
+
+  //to register/convert ioTag_t to ioRec_t in ioRecs:
+  IOInit( pin_io, resourceOwner_e, index );
+
+  //to configure GPIO pin:
+from drivers/io_types.h: {
+  // pin config handling
+  // pin config is packed into ioConfig_t to decrease memory requirements
+  // IOCFG_x macros are defined for common combinations for all CPUs; this
+  //  helps masking CPU differences
+
+  typedef uint8_t ioConfig_t;  // packed IO configuration
+}
+  IOConfigGPIO( pin_io, ioConfig_t cfg );
+  // or
+  IOConfigGPIOAF( pin_io, ioConfig_t cfg, uint8_t af );
+
+  // To produce input/output on GPIO (all of following defined in drivers/io.c):
+  bool b;
+  b = IORead( pin_io );
+  IOWrite( pint_io, b );
+  IOHi( pin_io );
+  IOLo( pin_io );
+  IOToggle( pin_io );
+  
+// Following used in drivers/io::IOConfigGPIO and IOConfigGPIOAF
+// -------------------------------------------------------------
+// from utils.h:
+#define LOG2_8BIT(v)  (8 - 90/(((v)/4+14)|1) - 2/((v)/2+1))
+#define LOG2_16BIT(v) (8*((v)>255) + LOG2_8BIT((v) >>8*((v)>255)))
+#define LOG2_32BIT(v) (16*((v)>65535L) + LOG2_16BIT((v)*1L >>16*((v)>65535L)))
+#define LOG2_64BIT(v) \
+    (32*((v)/2L>>31 > 0) \
+     + LOG2_32BIT((v)*1L >>16*((v)/2L>>31 > 0) \
+                         >>16*((v)/2L>>31 > 0)))
+#define LOG2(v) LOG2_64BIT(v)
+
+// from rcc.h
+// mask values (RCC_AHB.ENR_periphEN) defined in include files from lib
+#define RCC_ENCODE(reg, mask) (((reg) << 5) | LOG2_32BIT(mask))
+#define RCC_AHB(periph) RCC_ENCODE(RCC_AHB, RCC_AHBENR_ ## periph ## EN)
+#define RCC_APB2(periph) RCC_ENCODE(RCC_APB2, RCC_APB2ENR_ ## periph ## EN)
+#define RCC_APB1(periph) RCC_ENCODE(RCC_APB1, RCC_APB1ENR_ ## periph ## EN)
+#define RCC_AHB1(periph) RCC_ENCODE(RCC_AHB1, RCC_AHB1ENR_ ## periph ## EN)
+
+// from io.c:
+#elif defined(STM32F4)
+const struct ioPortDef_s ioPortDefs[] = {
+    { RCC_AHB1(GPIOA) },
+    { RCC_AHB1(GPIOB) },
+    { RCC_AHB1(GPIOC) },
+    { RCC_AHB1(GPIOD) },
+    { RCC_AHB1(GPIOE) },
+    { RCC_AHB1(GPIOF) },
+};
+
+###################### Status LEDS ############################
+
+files:
+  drivers/light_led.c/.h
+
+target.h:
+  LED0_PIN, LED1_PIN, LED2_PIN
+
+#define STATUS_LED_NUMBER 3
+
+typedef struct statusLedConfig_s {
+    ioTag_t ioTags[STATUS_LED_NUMBER];
+    uint8_t inversion;
+} statusLedConfig_t;
+
+#################### GPS as on iNav #############################
+
+gpsThread (io/gps)
+    gpsHandleProtocol {
+        read() pointing to one of: gpsHandleNAZA
+          gpsHandleI2CNAV (io/gps_i2cnav)
+            gpsPollI2CNAV
+              i2cnavGPSModuleRead (drivers/gps_i2cnav)
+                 i2cRead (drivers/bus_i2c_stm32f10x)
+                   i2cWaitForCompletion
+                     i2cStateMachine
+        sensorsSet
+        onNewGPSData (navigation/navigation)
+    }
+
+####################################################################################
+
+find .. -name "*.h" -exec grep -nH -e "^#define.*__attribute__" {} /dev/null \;
+
+../build/atomic.h:121:#define ATOMIC_BLOCK(prio) for ( uint8_t __basepri_save __attribute__ ((__cleanup__ (__basepriRestoreMem), __unused__)) = __get_BASEPRI(), \
+../build/atomic.h:130:#define ATOMIC_BLOCK_NB(prio) for ( uint8_t __basepri_save __attribute__ ((__cleanup__ (__basepriRestore), __unused__)) = __get_BASEPRI(), \
+../build/atomic.h:185:#define ATOMIC_OR(ptr, val) __sync_fetch_and_or(ptr, val)
+../build/atomic.h:186:#define ATOMIC_AND(ptr, val) __sync_fetch_and_and(ptr, val)
+../common/utils.h:116:#define FALLTHROUGH __attribute__ ((fallthrough))
+../pg/pg.h:62:#define PG_PACKED __attribute__((packed))
+../pg/pg.h:67:#define PG_REGISTER_ATTRIBUTES __attribute__ ((section("__DATA,__pg_registry"), used, aligned(4)))
+../pg/pg.h:71:#define PG_RESETDATA_ATTRIBUTES __attribute__ ((section("__DATA,__pg_resetdata"), used, aligned(2)))
+../pg/pg.h:75:#define PG_REGISTER_ATTRIBUTES __attribute__ ((section(".pg_registry"), used, aligned(4)))
+../pg/pg.h:79:#define PG_RESETDATA_ATTRIBUTES __attribute__ ((section(".pg_resetdata"), used, aligned(2)))
+../platform.h:23:#define NOINLINE __attribute__((noinline))
+../platform_paul.h:23:#define NOINLINE __attribute__((noinline))
+../target/common_fc_pre.h:98:#define FAST_CODE                   __attribute__((section(".tcm_code")))
+../target/common_fc_pre.h:104:#define FAST_RAM                    __attribute__ ((section(".fastram_bss"), aligned(4)))
+../target/common_fc_pre.h:105:#define FAST_RAM_INITIALIZED        __attribute__ ((section(".fastram_data"), aligned(4)))
+../target/common_fc_pre.h:113:#define PERSISTENT                  __attribute__ ((section(".persistent_data"), aligned(4)))
+../target/common_fc_pre.h:117:#define SRAM2                       __attribute__ ((section(".sram2"), aligned(4)))
+
+
+find src/main -type f -exec grep -nH -e IOInit {} /dev/null \;
+src/main/drivers/accgyro/accgyro_mpu.c:141:    IOInit(mpuIntIO, OWNER_MPU_EXTI, 0);
+src/main/drivers/accgyro/accgyro_mpu.c:145:    IOInit(mpuIntIO, OWNER_MPU_EXTI, 0);
+src/main/drivers/accgyro/accgyro_spi_bmi160.c:101:    IOInit(bus->busdev_u.spi.csnPin, OWNER_MPU_CS, 0);
+src/main/drivers/accgyro/accgyro_spi_bmi160.c:261:    IOInit(mpuIntIO, OWNER_MPU_EXTI, 0);
+src/main/drivers/accgyro/accgyro_spi_icm20649.c:49:    IOInit(bus->busdev_u.spi.csnPin, OWNER_MPU_CS, 0);
+src/main/drivers/accgyro/accgyro_spi_icm20689.c:49:    IOInit(bus->busdev_u.spi.csnPin, OWNER_MPU_CS, 0);
+src/main/drivers/accgyro/accgyro_spi_mpu6000.c:131:    IOInit(bus->busdev_u.spi.csnPin, OWNER_MPU_CS, 0);
+src/main/drivers/accgyro/accgyro_spi_mpu6500.c:45:    IOInit(bus->busdev_u.spi.csnPin, OWNER_MPU_CS, 0);
+src/main/drivers/accgyro/accgyro_spi_mpu9250.c:168:    IOInit(bus->busdev_u.spi.csnPin, OWNER_MPU_CS, 0);
+
+src/main/drivers/adc_stm32f4xx.c:226:        IOInit(IOGetByTag(adcOperatingConfig[i].tag), OWNER_ADC_BATT + i, 0);
+
+src/main/drivers/barometer/barometer_bmp085.c:150:        IOInit(xclrIO, OWNER_BARO_CS, 0);
+src/main/drivers/barometer/barometer_bmp085.c:181:        IOInit(eocIO, OWNER_BARO_EXTI, 0);
+src/main/drivers/barometer/barometer_bmp280.c:76:        IOInit(busdev->busdev_u.spi.csnPin, OWNER_BARO_CS, 0);
+src/main/drivers/barometer/barometer_bmp280.c:91:        IOInit(busdev->busdev_u.spi.csnPin, OWNER_SPI_PREINIT, 0);
+src/main/drivers/barometer/barometer_lps.c:255:    IOInit(busdev->busdev_u.spi.csnPin, OWNER_BARO_CS, 0);
+src/main/drivers/barometer/barometer_ms5611.c:72:        IOInit(busdev->busdev_u.spi.csnPin, OWNER_BARO_CS, 0);
+src/main/drivers/barometer/barometer_ms5611.c:87:        IOInit(busdev->busdev_u.spi.csnPin, OWNER_SPI_PREINIT, 0);
+
+src/main/drivers/bus_i2c_hal.c:238:    IOInit(scl, OWNER_I2C_SCL, RESOURCE_INDEX(device));
+src/main/drivers/bus_i2c_hal.c:239:    IOInit(sda, OWNER_I2C_SDA, RESOURCE_INDEX(device));
+src/main/drivers/bus_spi_config.c:46:        IOInit(io, OWNER_SPI_PREINIT, 0);
+src/main/drivers/bus_spi_config.c:55:        IOInit(io, OWNER_SPI_PREINIT, 0);
+src/main/drivers/bus_spi_ll.c:96:    IOInit(IOGetByTag(spi->sck),  OWNER_SPI_SCK,  RESOURCE_INDEX(device));
+src/main/drivers/bus_spi_ll.c:97:    IOInit(IOGetByTag(spi->miso), OWNER_SPI_MISO, RESOURCE_INDEX(device));
+src/main/drivers/bus_spi_ll.c:98:    IOInit(IOGetByTag(spi->mosi), OWNER_SPI_MOSI, RESOURCE_INDEX(device));
+src/main/drivers/bus_spi_soft.c:40:    IOInit(IOGetByTag(dev->sckTag),  OWNER_SPI_SCK,  RESOURCE_INDEX(SOFT_SPIDEV_1) + 10);
+src/main/drivers/bus_spi_soft.c:48:    IOInit(IOGetByTag(dev->mosiTag),  OWNER_SPI_MOSI,  RESOURCE_INDEX(SOFT_SPIDEV_1) + 10);
+src/main/drivers/bus_spi_soft.c:56:    IOInit(IOGetByTag(dev->misoTag),  OWNER_SPI_MISO,  RESOURCE_INDEX(SOFT_SPIDEV_1) + 10);
+src/main/drivers/bus_spi_soft.c:65:        IOInit(IOGetByTag(dev->nssTag),  OWNER_SPI_CS,  RESOURCE_INDEX(SOFT_SPIDEV_1) + 10);
+src/main/drivers/bus_spi_stdperiph.c:57:    IOInit(IOGetByTag(spi->sck),  OWNER_SPI_SCK,  RESOURCE_INDEX(device));
+src/main/drivers/bus_spi_stdperiph.c:58:    IOInit(IOGetByTag(spi->miso), OWNER_SPI_MISO, RESOURCE_INDEX(device));
+src/main/drivers/bus_spi_stdperiph.c:59:    IOInit(IOGetByTag(spi->mosi), OWNER_SPI_MOSI, RESOURCE_INDEX(device));
+
+src/main/drivers/buttons.c:57:    IOInit(buttonAPin, OWNER_SYSTEM, 0);
+src/main/drivers/buttons.c:63:    IOInit(buttonBPin, OWNER_SYSTEM, 0);
+
+src/main/drivers/camera_control.c:128:    IOInit(cameraControlRuntime.io, OWNER_CAMERA_CONTROL, 0);
+
+src/main/drivers/compass/compass_ak8963.c:381:        IOInit(busdev->busdev_u.spi.csnPin, OWNER_COMPASS_CS, 0);
+src/main/drivers/compass/compass_ak8963.c:415:        IOInit(busdev->busdev_u.spi.csnPin, OWNER_SPI_PREINIT, 0);
+src/main/drivers/compass/compass_hmc5883l.c:176:    IOInit(magIntIO, OWNER_COMPASS_EXTI, 0);
+src/main/drivers/compass/compass_hmc5883l.c:181:    IOInit(magIntIO, OWNER_COMPASS_EXTI, 0);
+src/main/drivers/compass/compass_hmc5883l.c:197:    IOInit(busdev->busdev_u.spi.csnPin, OWNER_COMPASS_CS, 0);
+
+src/main/drivers/flash.c:62:    IOInit(busdev->busdev_u.spi.csnPin, OWNER_FLASH_CS, 0);
+src/main/drivers/inverter.c:54:        IOInit(pin, OWNER_INVERTER, RESOURCE_INDEX(uartIndex));
+
+src/main/drivers/light_led.c:72:            IOInit(leds[i], OWNER_LED, RESOURCE_INDEX(i));
+src/main/drivers/light_ws2811strip_hal.c:84:    IOInit(ws2811IO, OWNER_LED_STRIP, 0);
+src/main/drivers/light_ws2811strip_stdperiph.c:77:    IOInit(ws2811IO, OWNER_LED_STRIP, 0);
+
+src/main/drivers/max7456.c:432:    IOInit(busdev->busdev_u.spi.csnPin, OWNER_OSD_CS, 0);
+src/main/drivers/max7456.c:769:    IOInit(max7456ResetPin, OWNER_OSD, 0);
+
+src/main/drivers/pinio.c:50:        IOInit(io, OWNER_PINIO, RESOURCE_INDEX(i));
+
+src/main/drivers/pwm_esc_detect.c:45:    IOInit(MotorDetectPin, OWNER_SYSTEM, 0);
+src/main/drivers/pwm_output.c:296:        IOInit(motors[motorIndex].io, OWNER_MOTOR, RESOURCE_INDEX(motorIndex));
+src/main/drivers/pwm_output.c:450:        IOInit(servos[servoIndex].io, OWNER_SERVO, RESOURCE_INDEX(servoIndex));
+src/main/drivers/pwm_output.c:498:        IOInit(beeperPwm.io, OWNER_BEEPER, RESOURCE_INDEX(0));
+
+src/main/drivers/rangefinder/rangefinder_hcsr04.c:158:    IOInit(triggerIO, OWNER_SONAR_TRIGGER, 0);
+src/main/drivers/rangefinder/rangefinder_hcsr04.c:164:    IOInit(echoIO, OWNER_SONAR_ECHO, 0);
+
+src/main/drivers/rx/rx_a7105.c:60:    IOInit(rxIntIO, OWNER_RX_SPI_CS, 0);
+src/main/drivers/rx/rx_a7105.c:73:    IOInit(txEnIO, OWNER_RX_SPI_CS, 0);
+src/main/drivers/rx/rx_nrf24l01.c:65:    IOInit(DEFIO_IO(RX_CE_PIN), OWNER_RX_SPI_CS, rxSPIDevice + 1);
+src/main/drivers/rx/rx_pwm.c:388:        IOInit(io, OWNER_PWMINPUT, RESOURCE_INDEX(channel));
+src/main/drivers/rx/rx_pwm.c:441:    IOInit(io, OWNER_PPMINPUT, 0);
+src/main/drivers/rx/rx_spi.c:75:    IOInit(rxCsPin, OWNER_RX_SPI_CS, rxSPIDevice + 1);
+
+src/main/drivers/sdcard.c:123:        IOInit(sdcard.cardDetectPin, OWNER_FREE, 0);
+src/main/drivers/sdcard.c:131:        IOInit(sdcard.cardDetectPin, OWNER_SDCARD_DETECT, 0);
+src/main/drivers/sdcard.c:584:        IOInit(sdcard.chipSelectPin, OWNER_SDCARD_CS, 0);
+src/main/drivers/sdcard_sdio_baremetal.c:140:        IOInit(sdcard.cardDetectPin, OWNER_FREE, 0);
+src/main/drivers/sdcard_sdio_baremetal.c:148:        IOInit(sdcard.cardDetectPin, OWNER_SDCARD_DETECT, 0);
+
+src/main/drivers/sdio_f4xx.c:1581:    IOInit(d0, OWNER_SDCARD, 0);
+src/main/drivers/sdio_f4xx.c:1582:    IOInit(d1, OWNER_SDCARD, 0);
+src/main/drivers/sdio_f4xx.c:1583:    IOInit(d2, OWNER_SDCARD, 0);
+src/main/drivers/sdio_f4xx.c:1584:    IOInit(d3, OWNER_SDCARD, 0);
+src/main/drivers/sdio_f4xx.c:1585:    IOInit(clk, OWNER_SDCARD, 0);
+src/main/drivers/sdio_f4xx.c:1586:    IOInit(cmd, OWNER_SDCARD, 0);
+
+src/main/drivers/serial_escserial.c:185:    IOInit(IOGetByTag(tag), OWNER_MOTOR, 0);
+
+src/main/drivers/serial_softserial.c:262:        IOInit(txIO, OWNER_SERIAL_TX, RESOURCE_INDEX(portIndex + RESOURCE_SOFT_OFFSET));
+src/main/drivers/serial_softserial.c:272:            IOInit(rxIO, OWNER_SERIAL_RX, RESOURCE_INDEX(portIndex + RESOURCE_SOFT_OFFSET));
+src/main/drivers/serial_softserial.c:291:            IOInit(txIO, OWNER_SERIAL_TX, RESOURCE_INDEX(portIndex + RESOURCE_SOFT_OFFSET));
+src/main/drivers/serial_uart_stm32f4xx.c:232:        IOInit(txIO, OWNER_SERIAL_TX, RESOURCE_INDEX(device));
+src/main/drivers/serial_uart_stm32f4xx.c:236:            IOInit(txIO, OWNER_SERIAL_TX, RESOURCE_INDEX(device));
+src/main/drivers/serial_uart_stm32f4xx.c:241:            IOInit(rxIO, OWNER_SERIAL_RX, RESOURCE_INDEX(device));
+
+src/main/drivers/serial_usb_vcp.c:205:    IOInit(IOGetByTag(IO_TAG(PA11)), OWNER_USB, 0);
+src/main/drivers/serial_usb_vcp.c:206:    IOInit(IOGetByTag(IO_TAG(PA12)), OWNER_USB, 0);
+src/main/drivers/serial_usb_vcp.c:219:    IOInit(IOGetByTag(IO_TAG(PA11)), OWNER_USB, 0);
+src/main/drivers/serial_usb_vcp.c:220:    IOInit(IOGetByTag(IO_TAG(PA12)), OWNER_USB, 0);
+src/main/drivers/sound_beeper.c:71:            IOInit(beeperIO, OWNER_BEEPER, 0);
+
+src/main/drivers/timer.c:495:    IOInit(IOGetByTag(timHw->tag), OWNER_TIMER, 0);
+src/main/drivers/timer_hal.c:561:    IOInit(IOGetByTag(timHw->tag), OWNER_TIMER, 0);
+
+src/main/drivers/transponder_ir_io_hal.c:98:    IOInit(transponderIO, OWNER_TRANSPONDER, 0);
+src/main/drivers/transponder_ir_io_hal.c:245:    IOInit(transponderIO, OWNER_TRANSPONDER, 0);
+src/main/drivers/transponder_ir_io_stdperiph.c:83:    IOInit(transponderIO, OWNER_TRANSPONDER, 0);
+src/main/drivers/transponder_ir_io_stdperiph.c:218:    IOInit(transponderIO, OWNER_TRANSPONDER, 0);
+
+src/main/drivers/usb_io.c:21:    IOInit(usbDetectPin, OWNER_FREE, 0);
+src/main/drivers/usb_io.c:35:    IOInit(usbDetectPin, OWNER_USB_DETECT, 0);
+src/main/drivers/usb_msc_f4xx.c:73:        IOInit(mscButton, OWNER_USB_MSC_PIN, 0);
+src/main/drivers/usb_msc_f4xx.c:89:    IOInit(IOGetByTag(IO_TAG(PA11)), OWNER_USB, 0);
+src/main/drivers/usb_msc_f4xx.c:90:    IOInit(IOGetByTag(IO_TAG(PA12)), OWNER_USB, 0);
+
+src/main/drivers/vtx_rtc6705.c:104:    IOInit(vtxPowerPin, OWNER_VTX, 0);
+src/main/drivers/vtx_rtc6705.c:116:    IOInit(vtxCSPin, OWNER_VTX, 0);
+
+src/main/drivers/vtx_rtc6705_soft_spi.c:67:    IOInit(vtxPowerPin, OWNER_VTX, 0);
+
+src/main/drivers/vtx_rtc6705_soft_spi.c:77:    IOInit(rtc6705DataPin, OWNER_SPI_MOSI, RESOURCE_SOFT_OFFSET);
+src/main/drivers/vtx_rtc6705_soft_spi.c:80:    IOInit(rtc6705ClkPin, OWNER_SPI_SCK, RESOURCE_SOFT_OFFSET);
+src/main/drivers/vtx_rtc6705_soft_spi.c:86:    IOInit(rtc6705CsnPin, OWNER_SPI_CS, RESOURCE_SOFT_OFFSET);
+
+src/main/fc/fc_init.c:172:    IOInit(busSwitchResetPin, OWNER_SYSTEM, 0);
+
+src/main/msc/usbd_storage_sdio.c:153:	IOInit(sd_det, OWNER_SDCARD_DETECT, 0);
+src/main/osd_slave/osd_slave_init.c:118:    IOInit(busSwitchResetPin, OWNER_SYSTEM, 0);
+
+src/main/rx/cc2500_frsky_shared.c:568:    IOInit(gdoPin, OWNER_RX_SPI, 0);
+src/main/rx/cc2500_frsky_shared.c:572:    IOInit(frSkyLedPin, OWNER_LED, 0);
+src/main/rx/cc2500_frsky_shared.c:577:    IOInit(rxLnaEnPin, OWNER_RX_SPI, 0);
+src/main/rx/cc2500_frsky_shared.c:583:    IOInit(txEnPin, OWNER_RX_SPI, 0);
+src/main/rx/cc2500_frsky_shared.c:588:    IOInit(antSelPin, OWNER_RX_SPI, 0);
+src/main/rx/cc2500_frsky_shared.c:594:    IOInit(bindPin, OWNER_RX_BIND, 0);
+src/main/rx/flysky.c:367:    IOInit(bindPin, OWNER_RX_BIND, 0);
+src/main/rx/flysky.c:371:    IOInit(flySkyLedPin, OWNER_LED, 0); 
+src/main/rx/spektrum.c:190:        IOInit(BindPlug, OWNER_RX_BIND, 0);
+src/main/rx/spektrum.c:256:    IOInit(bindIO, OWNER_RX_BIND, 0);
+
+src/main/sensors/gyro.c:555:        IOInit(gyroSensor1.gyroDev.bus.busdev_u.spi.csnPin, OWNER_MPU_CS, RESOURCE_INDEX(0));
+src/main/sensors/gyro.c:564:        IOInit(gyroSensor2.gyroDev.bus.busdev_u.spi.csnPin, OWNER_MPU_CS, RESOURCE_INDEX(1));
+
+Grep finished (matches found) at Fri Aug  3 20:10:53
+
+find src -type f -exec grep -nH -e IOConfigGPIO {} /dev/null \;
+src/main/drivers/accgyro/accgyro_spi_bmi160.c:102:    IOConfigGPIO(bus->busdev_u.spi.csnPin, SPI_IO_CS_CFG);
+src/main/drivers/accgyro/accgyro_spi_bmi160.c:262:    IOConfigGPIO(mpuIntIO, IOCFG_IN_FLOATING);   // TODO - maybe pullup / pulldown ?
+src/main/drivers/accgyro/accgyro_spi_icm20649.c:50:    IOConfigGPIO(bus->busdev_u.spi.csnPin, SPI_IO_CS_CFG);
+src/main/drivers/accgyro/accgyro_spi_icm20689.c:50:    IOConfigGPIO(bus->busdev_u.spi.csnPin, SPI_IO_CS_CFG);
+src/main/drivers/accgyro/accgyro_spi_mpu6000.c:132:    IOConfigGPIO(bus->busdev_u.spi.csnPin, SPI_IO_CS_CFG);
+src/main/drivers/accgyro/accgyro_spi_mpu6500.c:46:    IOConfigGPIO(bus->busdev_u.spi.csnPin, SPI_IO_CS_CFG);
+src/main/drivers/accgyro/accgyro_spi_mpu9250.c:169:    IOConfigGPIO(bus->busdev_u.spi.csnPin, SPI_IO_CS_CFG);
+src/main/drivers/accgyro_legacy/accgyro_l3gd20.c:87:    IOConfigGPIO(mpul3gd20CsPin, SPI_IO_CS_CFG);
+src/main/drivers/accgyro_legacy/accgyro_mma845x.c:91:    IOConfigGPIO(IOGetByTag(IO_TAG(MMA8451_INT_PIN)), IOCFG_IN_FLOATING);
+src/main/drivers/adc_stm32f10x.c:105:        IOConfigGPIO(IOGetByTag(adcOperatingConfig[i].tag), IO_CONFIG(GPIO_Mode_AIN, 0));
+src/main/drivers/adc_stm32f30x.c:138:        IOConfigGPIO(IOGetByTag(adcOperatingConfig[i].tag), IO_CONFIG(GPIO_Mode_AN, 0, GPIO_OType_OD, GPIO_PuPd_NOPULL));
+src/main/drivers/adc_stm32f4xx.c:227:        IOConfigGPIO(IOGetByTag(adcOperatingConfig[i].tag), IO_CONFIG(GPIO_Mode_AN, 0, GPIO_OType_OD, GPIO_PuPd_NOPULL));
+src/main/drivers/adc_stm32f7xx.c:254:        IOConfigGPIO(IOGetByTag(adcOperatingConfig[i].tag), IO_CONFIG(GPIO_MODE_ANALOG, 0, GPIO_NOPULL));
+src/main/drivers/barometer/barometer_bmp085.c:151:        IOConfigGPIO(xclrIO, IOCFG_OUT_PP);
+src/main/drivers/barometer/barometer_bmp085.c:182:        IOConfigGPIO(eocIO, Mode_IN_FLOATING);
+src/main/drivers/barometer/barometer_bmp280.c:77:        IOConfigGPIO(busdev->busdev_u.spi.csnPin, IOCFG_OUT_PP);
+src/main/drivers/barometer/barometer_bmp280.c:89:        IOConfigGPIO(busdev->busdev_u.spi.csnPin, IOCFG_IPU);
+src/main/drivers/barometer/barometer_lps.c:256:    IOConfigGPIO(busdev->busdev_u.spi.csnPin, IOCFG_OUT_PP);
+src/main/drivers/barometer/barometer_ms5611.c:73:        IOConfigGPIO(busdev->busdev_u.spi.csnPin, IOCFG_OUT_PP);
+src/main/drivers/barometer/barometer_ms5611.c:85:        IOConfigGPIO(busdev->busdev_u.spi.csnPin, IOCFG_IPU);
+src/main/drivers/bus_i2c_hal.c:248:    IOConfigGPIOAF(scl, pDev->pullUp ? IOCFG_I2C_PU : IOCFG_I2C, GPIO_AF4_I2C);
+src/main/drivers/bus_i2c_hal.c:249:    IOConfigGPIOAF(sda, pDev->pullUp ? IOCFG_I2C_PU : IOCFG_I2C, GPIO_AF4_I2C);
+src/main/drivers/bus_i2c_hal.c:251:    IOConfigGPIO(scl, IOCFG_AF_OD);
+src/main/drivers/bus_i2c_hal.c:252:    IOConfigGPIO(sda, IOCFG_AF_OD);
+src/main/drivers/bus_i2c_hal.c:303:    IOConfigGPIO(scl, IOCFG_OUT_OD);
+src/main/drivers/bus_i2c_hal.c:304:    IOConfigGPIO(sda, IOCFG_OUT_OD);
+src/main/drivers/bus_i2c_soft.c:178:    IOConfigGPIO(scl, IOCFG_OUT_OD);
+src/main/drivers/bus_i2c_soft.c:179:    IOConfigGPIO(sda, IOCFG_OUT_OD);
+src/main/drivers/bus_i2c_stm32f10x.c:437:    IOConfigGPIOAF(scl, pDev->pullUp ? IOCFG_I2C_PU : IOCFG_I2C, pDev->sclAF);
+src/main/drivers/bus_i2c_stm32f10x.c:438:    IOConfigGPIOAF(sda, pDev->pullUp ? IOCFG_I2C_PU : IOCFG_I2C, pDev->sdaAF);
+src/main/drivers/bus_i2c_stm32f10x.c:440:    IOConfigGPIO(scl, IOCFG_I2C);
+src/main/drivers/bus_i2c_stm32f10x.c:441:    IOConfigGPIO(sda, IOCFG_I2C);
+src/main/drivers/bus_i2c_stm32f10x.c:491:    IOConfigGPIO(scl, IOCFG_OUT_OD);
+src/main/drivers/bus_i2c_stm32f10x.c:492:    IOConfigGPIO(sda, IOCFG_OUT_OD);
+src/main/drivers/bus_i2c_stm32f30x.c:106:    IOConfigGPIOAF(scl, pDev->pullUp ? IOCFG_I2C_PU : IOCFG_I2C, GPIO_AF_4);
+src/main/drivers/bus_i2c_stm32f30x.c:109:    IOConfigGPIOAF(sda, pDev->pullUp ? IOCFG_I2C_PU : IOCFG_I2C, GPIO_AF_4);
+src/main/drivers/bus_spi_config.c:47:        IOConfigGPIO(io, IOCFG_IPU);
+src/main/drivers/bus_spi_config.c:56:        IOConfigGPIO(io, IOCFG_OUT_PP);
+src/main/drivers/bus_spi_ll.c:101:        IOConfigGPIOAF(IOGetByTag(spi->sck), SPI_IO_AF_SCK_CFG_LOW, spi->sckAF);
+src/main/drivers/bus_spi_ll.c:103:        IOConfigGPIOAF(IOGetByTag(spi->sck), SPI_IO_AF_SCK_CFG_HIGH, spi->sckAF);
+src/main/drivers/bus_spi_ll.c:104:    IOConfigGPIOAF(IOGetByTag(spi->miso), SPI_IO_AF_MISO_CFG, spi->misoAF);
+src/main/drivers/bus_spi_ll.c:105:    IOConfigGPIOAF(IOGetByTag(spi->mosi), SPI_IO_AF_CFG, spi->mosiAF);
+src/main/drivers/bus_spi_soft.c:42:    IOConfigGPIO(IOGetByTag(dev->sckTag), IO_CONFIG(GPIO_Mode_Out_PP, GPIO_Speed_50MHz));
+src/main/drivers/bus_spi_soft.c:44:    IOConfigGPIOAF(IOGetByTag(dev->sckTag), SPI_IO_AF_CFG, 0);
+src/main/drivers/bus_spi_soft.c:50:    IOConfigGPIO(IOGetByTag(dev->mosiTag), IO_CONFIG(GPIO_Mode_Out_PP, GPIO_Speed_50MHz));
+src/main/drivers/bus_spi_soft.c:52:    IOConfigGPIOAF(IOGetByTag(dev->mosiTag), SPI_IO_AF_CFG, 0);
+src/main/drivers/bus_spi_soft.c:58:    IOConfigGPIO(IOGetByTag(dev->misoTag), IO_CONFIG(GPIO_Mode_IN_FLOATING, GPIO_Speed_50MHz));
+src/main/drivers/bus_spi_soft.c:60:    IOConfigGPIOAF(IOGetByTag(dev->misoTag), SPI_IO_AF_CFG, 0);
+src/main/drivers/bus_spi_soft.c:67:        IOConfigGPIO(IOGetByTag(dev->nssTag), IO_CONFIG(GPIO_Mode_Out_PP, GPIO_Speed_50MHz));
+src/main/drivers/bus_spi_soft.c:69:        IOConfigGPIOAF(IOGetByTag(dev->nssTag), SPI_IO_AF_CFG, 0);
+src/main/drivers/bus_spi_stdperiph.c:62:    IOConfigGPIOAF(IOGetByTag(spi->sck),  SPI_IO_AF_CFG, spi->af);
+src/main/drivers/bus_spi_stdperiph.c:63:    IOConfigGPIOAF(IOGetByTag(spi->miso), SPI_IO_AF_CFG, spi->af);
+src/main/drivers/bus_spi_stdperiph.c:64:    IOConfigGPIOAF(IOGetByTag(spi->mosi), SPI_IO_AF_CFG, spi->af);
+src/main/drivers/bus_spi_stdperiph.c:66:    IOConfigGPIO(IOGetByTag(spi->sck), SPI_IO_AF_SCK_CFG);
+src/main/drivers/bus_spi_stdperiph.c:67:    IOConfigGPIO(IOGetByTag(spi->miso), SPI_IO_AF_MISO_CFG);
+src/main/drivers/bus_spi_stdperiph.c:68:    IOConfigGPIO(IOGetByTag(spi->mosi), SPI_IO_AF_MOSI_CFG);
+src/main/drivers/buttons.c:58:    IOConfigGPIO(buttonAPin, BUTTON_A_PIN_GPIO_MODE);
+src/main/drivers/buttons.c:64:    IOConfigGPIO(buttonBPin, BUTTON_B_PIN_GPIO_MODE);
+src/main/drivers/camera_control.c:139:            IOConfigGPIO(cameraControlRuntime.io, IOCFG_AF_PP);
+src/main/drivers/camera_control.c:141:            IOConfigGPIOAF(cameraControlRuntime.io, IOCFG_AF_PP, timerHardware->alternateFunction);
+src/main/drivers/camera_control.c:153:        IOConfigGPIO(cameraControlRuntime.io, IOCFG_OUT_PP);
+src/main/drivers/compass/compass_ak8963.c:382:        IOConfigGPIO(busdev->busdev_u.spi.csnPin, IOCFG_OUT_PP);
+src/main/drivers/compass/compass_ak8963.c:413:        IOConfigGPIO(busdev->busdev_u.spi.csnPin, IOCFG_IPU);
+src/main/drivers/compass/compass_hmc5883l.c:182:    IOConfigGPIO(magIntIO, IOCFG_IN_FLOATING);
+src/main/drivers/compass/compass_hmc5883l.c:198:    IOConfigGPIO(busdev->busdev_u.spi.csnPin, IOCFG_OUT_PP);
+src/main/drivers/flash.c:63:    IOConfigGPIO(busdev->busdev_u.spi.csnPin, SPI_IO_CS_CFG);
+src/main/drivers/inverter.c:55:        IOConfigGPIO(pin, IOCFG_OUT_PP);
+src/main/drivers/io.c:274:void IOConfigGPIO(IO_t io, ioConfig_t cfg)
+src/main/drivers/io.c:293:void IOConfigGPIO(IO_t io, ioConfig_t cfg)
+src/main/drivers/io.c:295:    IOConfigGPIOAF(io, cfg, 0);
+src/main/drivers/io.c:298:void IOConfigGPIOAF(IO_t io, ioConfig_t cfg, uint8_t af)
+src/main/drivers/io.c:321:void IOConfigGPIO(IO_t io, ioConfig_t cfg)
+src/main/drivers/io.c:340:void IOConfigGPIOAF(IO_t io, ioConfig_t cfg, uint8_t af)
+src/main/drivers/io.h:95:void IOConfigGPIO(IO_t io, ioConfig_t cfg);
+src/main/drivers/io.h:97:void IOConfigGPIOAF(IO_t io, ioConfig_t cfg, uint8_t af);
+src/main/drivers/light_led.c:73:            IOConfigGPIO(leds[i], IOCFG_OUT_PP);
+src/main/drivers/light_ws2811strip_hal.c:85:    IOConfigGPIOAF(ws2811IO, IO_CONFIG(GPIO_MODE_AF_PP, GPIO_SPEED_FREQ_VERY_HIGH, GPIO_PULLDOWN), timerHardware->alternateFunction);
+src/main/drivers/light_ws2811strip_stdperiph.c:79:    IOConfigGPIO(ws2811IO, IO_CONFIG(GPIO_Speed_50MHz, GPIO_Mode_AF_PP));
+src/main/drivers/light_ws2811strip_stdperiph.c:81:    IOConfigGPIOAF(ws2811IO, IO_CONFIG(GPIO_Mode_AF, GPIO_Speed_50MHz, GPIO_OType_PP, GPIO_PuPd_UP), timerHardware->alternateFunction);
+src/main/drivers/max7456.c:433:    IOConfigGPIO(busdev->busdev_u.spi.csnPin, SPI_IO_CS_CFG);
+src/main/drivers/max7456.c:770:    IOConfigGPIO(max7456ResetPin, IO_RESET_CFG);
+src/main/drivers/pinio.c:54:            IOConfigGPIO(io, IOCFG_OUT_PP);
+src/main/drivers/pwm_esc_detect.c:46:    IOConfigGPIO(MotorDetectPin, IOCFG_IPU);
+src/main/drivers/pwm_output.c:310:        IOConfigGPIO(motors[motorIndex].io, IOCFG_AF_PP);
+src/main/drivers/pwm_output.c:312:        IOConfigGPIOAF(motors[motorIndex].io, IOCFG_AF_PP, timerHardware->alternateFunction);
+src/main/drivers/pwm_output.c:454:        IOConfigGPIOAF(servos[servoIndex].io, IOCFG_AF_PP, timer->alternateFunction);
+src/main/drivers/pwm_output.c:456:        IOConfigGPIO(servos[servoIndex].io, IOCFG_AF_PP);
+src/main/drivers/pwm_output.c:500:        IOConfigGPIOAF(beeperPwm.io, IOCFG_AF_PP, timer->alternateFunction);
+src/main/drivers/pwm_output.c:502:        IOConfigGPIO(beeperPwm.io, IOCFG_AF_PP);
+src/main/drivers/pwm_output_dshot.c:168:    IOConfigGPIOAF(motorIO, IO_CONFIG(GPIO_Mode_AF, GPIO_Speed_50MHz, GPIO_OType_PP, GPIO_PuPd_UP), timerHardware->alternateFunction);
+src/main/drivers/pwm_output_dshot_hal.c:156:    IOConfigGPIOAF(motorIO, IO_CONFIG(GPIO_MODE_AF_PP, GPIO_SPEED_FREQ_VERY_HIGH, GPIO_PULLDOWN), timerHardware->alternateFunction);
+src/main/drivers/rangefinder/rangefinder_hcsr04.c:159:    IOConfigGPIO(triggerIO, IOCFG_OUT_PP);
+src/main/drivers/rangefinder/rangefinder_hcsr04.c:165:    IOConfigGPIO(echoIO, IOCFG_IN_FLOATING);
+src/main/drivers/rx/rx_a7105.c:65:    IOConfigGPIO(rxIntIO, IOCFG_IPD);
+src/main/drivers/rx/rx_a7105.c:74:    IOConfigGPIO(txEnIO, IOCFG_OUT_PP);
+src/main/drivers/rx/rx_nrf24l01.c:66:    IOConfigGPIO(DEFIO_IO(RX_CE_PIN), SPI_IO_CS_CFG);
+src/main/drivers/rx/rx_pwm.c:390:        IOConfigGPIO(io, IOCFG_IPD);
+src/main/drivers/rx/rx_pwm.c:392:        IOConfigGPIOAF(io, IOCFG_AF_PP, timer->alternateFunction);
+src/main/drivers/rx/rx_pwm.c:443:    IOConfigGPIO(io, IOCFG_IPD);
+src/main/drivers/rx/rx_pwm.c:445:    IOConfigGPIOAF(io, IOCFG_AF_PP, timer->alternateFunction);
+src/main/drivers/rx/rx_spi.c:76:    IOConfigGPIO(rxCsPin, SPI_IO_CS_CFG);
+src/main/drivers/sdcard.c:124:        IOConfigGPIO(sdcard.cardDetectPin, IOCFG_IN_FLOATING);
+src/main/drivers/sdcard.c:132:        IOConfigGPIO(sdcard.cardDetectPin, IOCFG_IPU);
+src/main/drivers/sdcard.c:585:        IOConfigGPIO(sdcard.chipSelectPin, SPI_IO_CS_CFG);
+src/main/drivers/sdcard_sdio_baremetal.c:141:        IOConfigGPIO(sdcard.cardDetectPin, IOCFG_IN_FLOATING);
+src/main/drivers/sdcard_sdio_baremetal.c:149:        IOConfigGPIO(sdcard.cardDetectPin, IOCFG_IPU);
+src/main/drivers/sdio_f4xx.c:1592:    IOConfigGPIOAF(d0, SDIO_DATA, GPIO_AF_SDIO);
+src/main/drivers/sdio_f4xx.c:1593:    IOConfigGPIOAF(d1, SDIO_DATA, GPIO_AF_SDIO);
+src/main/drivers/sdio_f4xx.c:1594:    IOConfigGPIOAF(d2, SDIO_DATA, GPIO_AF_SDIO);
+src/main/drivers/sdio_f4xx.c:1595:    IOConfigGPIOAF(d3, SDIO_DATA, GPIO_AF_SDIO);
+src/main/drivers/sdio_f4xx.c:1596:    IOConfigGPIOAF(clk, SDIO_CLK, GPIO_AF_SDIO);
+src/main/drivers/sdio_f4xx.c:1597:    IOConfigGPIOAF(cmd, SDIO_CMD, GPIO_AF_SDIO);
+src/main/drivers/sdio_f7xx.c:1594:    IOConfigGPIOAF(d0, SDMMC_DATA, GPIO_AF12_SDMMC1);
+src/main/drivers/sdio_f7xx.c:1596:    IOConfigGPIOAF(d1, SDMMC_DATA, GPIO_AF12_SDMMC1);
+src/main/drivers/sdio_f7xx.c:1597:    IOConfigGPIOAF(d2, SDMMC_DATA, GPIO_AF12_SDMMC1);
+src/main/drivers/sdio_f7xx.c:1598:    IOConfigGPIOAF(d3, SDMMC_DATA, GPIO_AF12_SDMMC1);
+src/main/drivers/sdio_f7xx.c:1600:    IOConfigGPIOAF(clk, SDMMC_CLK, GPIO_AF12_SDMMC1);
+src/main/drivers/sdio_f7xx.c:1601:    IOConfigGPIOAF(cmd, SDMMC_CMD, GPIO_AF12_SDMMC1);
+src/main/drivers/serial_escserial.c:187:    IOConfigGPIOAF(IOGetByTag(tag), cfg, timhw->alternateFunction);
+src/main/drivers/serial_escserial.c:189:    IOConfigGPIO(IOGetByTag(tag), cfg);
+src/main/drivers/serial_softserial.c:136:        IOConfigGPIO(softSerial->rxIO, IOCFG_IPD);
+src/main/drivers/serial_softserial.c:139:        IOConfigGPIOAF(softSerial->rxIO, pinConfig, softSerial->timerHardware->alternateFunction);
+src/main/drivers/serial_softserial.c:143:        IOConfigGPIO(softSerial->rxIO, IOCFG_IPU);
+src/main/drivers/serial_softserial.c:146:        IOConfigGPIOAF(softSerial->rxIO, pinConfig, softSerial->timerHardware->alternateFunction);
+src/main/drivers/serial_softserial.c:169:    IOConfigGPIO(softSerial->rxIO, IOCFG_IN_FLOATING);
+src/main/drivers/serial_softserial.c:176:    IOConfigGPIO(softSerial->txIO, IOCFG_OUT_PP);
+src/main/drivers/serial_softserial.c:179:        IOConfigGPIOAF(softSerial->txIO, IOCFG_OUT_PP, softSerial->exTimerHardware->alternateFunction);
+src/main/drivers/serial_softserial.c:181:        IOConfigGPIO(softSerial->txIO, IOCFG_OUT_PP);
+src/main/drivers/serial_softserial.c:188:    IOConfigGPIO(softSerial->txIO, IOCFG_IN_FLOATING);
+src/main/drivers/serial_softserial.c:191:        IOConfigGPIOAF(softSerial->txIO, IOCFG_IN_FLOATING, softSerial->exTimerHardware->alternateFunction);
+src/main/drivers/serial_softserial.c:193:        IOConfigGPIO(softSerial->txIO, IOCFG_IN_FLOATING);
+src/main/drivers/serial_uart_stm32f10x.c:153:        IOConfigGPIO(txIO, (options & SERIAL_BIDIR_PP) ? IOCFG_AF_PP : IOCFG_AF_OD);
+src/main/drivers/serial_uart_stm32f10x.c:157:            IOConfigGPIO(txIO, IOCFG_AF_PP);
+src/main/drivers/serial_uart_stm32f10x.c:161:            IOConfigGPIO(rxIO, IOCFG_IPU);
+src/main/drivers/serial_uart_stm32f30x.c:188:        IOConfigGPIOAF(txIO, ioCfg, af);
+src/main/drivers/serial_uart_stm32f30x.c:196:            IOConfigGPIOAF(txIO, ioCfg, af);
+src/main/drivers/serial_uart_stm32f30x.c:201:            IOConfigGPIOAF(rxIO, ioCfg, af);
+src/main/drivers/serial_uart_stm32f4xx.c:233:        IOConfigGPIOAF(txIO, (options & SERIAL_BIDIR_PP) ? IOCFG_AF_PP : IOCFG_AF_OD, hardware->af);
+src/main/drivers/serial_uart_stm32f4xx.c:237:            IOConfigGPIOAF(txIO, IOCFG_AF_PP_UP, hardware->af);
+src/main/drivers/serial_uart_stm32f4xx.c:242:            IOConfigGPIOAF(rxIO, IOCFG_AF_PP_UP, hardware->af);
+src/main/drivers/serial_uart_stm32f7xx.c:385:        IOConfigGPIOAF(txIO, ioCfg, hardware->af);
+src/main/drivers/serial_uart_stm32f7xx.c:390:            IOConfigGPIOAF(txIO, IOCFG_AF_PP, hardware->af);
+src/main/drivers/serial_uart_stm32f7xx.c:395:            IOConfigGPIOAF(rxIO, IOCFG_AF_PP, hardware->af);
+src/main/drivers/sound_beeper.c:72:            IOConfigGPIO(beeperIO, config->isOpenDrain ? IOCFG_OUT_OD : IOCFG_OUT_PP);
+src/main/drivers/timer.c:496:    IOConfigGPIO(IOGetByTag(timHw->tag), mode);
+src/main/drivers/timer.c:792:        // XXX IOConfigGPIOAF in timerInit should eventually go away.
+src/main/drivers/timer.c:793:        IOConfigGPIOAF(IOGetByTag(timerHardwarePtr->tag), IOCFG_AF_PP, timerHardwarePtr->alternateFunction);
+src/main/drivers/timer_hal.c:562:    IOConfigGPIO(IOGetByTag(timHw->tag), mode);
+src/main/drivers/timer_hal.c:881:        // XXX IOConfigGPIOAF in timerInit should eventually go away.
+src/main/drivers/timer_hal.c:882:        IOConfigGPIOAF(IOGetByTag(timerHardwarePtr->tag), IOCFG_AF_PP, timerHardwarePtr->alternateFunction);
+src/main/drivers/transponder_ir_io_hal.c:99:    IOConfigGPIOAF(transponderIO, IO_CONFIG(GPIO_MODE_AF_PP, GPIO_SPEED_FREQ_VERY_HIGH, GPIO_PULLDOWN), timerHardware->alternateFunction);
+src/main/drivers/transponder_ir_io_hal.c:253:    IOConfigGPIOAF(transponderIO, IO_CONFIG(GPIO_MODE_AF_PP, GPIO_SPEED_FREQ_VERY_HIGH, GPIO_PULLDOWN), timerHardware->alternateFunction);
+src/main/drivers/transponder_ir_io_stdperiph.c:84:    IOConfigGPIOAF(transponderIO, IO_CONFIG(GPIO_Mode_AF, GPIO_Speed_50MHz, GPIO_OType_PP, GPIO_PuPd_DOWN), timerHardware->alternateFunction);
+src/main/drivers/transponder_ir_io_stdperiph.c:219:    IOConfigGPIOAF(transponderIO, IO_CONFIG(GPIO_Mode_AF, GPIO_Speed_50MHz, GPIO_OType_PP, GPIO_PuPd_DOWN), timerHardware->alternateFunction);
+src/main/drivers/usb_io.c:22:    IOConfigGPIO(usbDetectPin, IOCFG_IN_FLOATING);
+src/main/drivers/usb_io.c:36:    IOConfigGPIO(usbDetectPin, IOCFG_OUT_PP);
+src/main/drivers/usb_io.c:57:    IOConfigGPIO(usbPin, IOCFG_OUT_OD);
+src/main/drivers/usb_msc_f4xx.c:75:            IOConfigGPIO(mscButton, IOCFG_IPU);
+src/main/drivers/usb_msc_f4xx.c:77:            IOConfigGPIO(mscButton, IOCFG_IPD);
+src/main/drivers/usb_msc_f7xx.c:64:            IOConfigGPIO(mscButton, IOCFG_IPU);
+src/main/drivers/usb_msc_f7xx.c:66:            IOConfigGPIO(mscButton, IOCFG_IPD);
+src/main/drivers/vtx_rtc6705.c:107:    IOConfigGPIO(vtxPowerPin, IOCFG_OUT_PP);
+src/main/drivers/vtx_rtc6705.c:121:    IOConfigGPIO(vtxCSPin, IOCFG_OUT_PP);
+src/main/drivers/vtx_rtc6705_soft_spi.c:70:    IOConfigGPIO(vtxPowerPin, IOCFG_OUT_PP);
+src/main/drivers/vtx_rtc6705_soft_spi.c:78:    IOConfigGPIO(rtc6705DataPin, IOCFG_OUT_PP);
+src/main/drivers/vtx_rtc6705_soft_spi.c:81:    IOConfigGPIO(rtc6705ClkPin, IOCFG_OUT_PP);
+src/main/drivers/vtx_rtc6705_soft_spi.c:87:    IOConfigGPIO(rtc6705CsnPin, IOCFG_OUT_PP);
+src/main/fc/fc_init.c:173:    IOConfigGPIO(busSwitchResetPin, IOCFG_OUT_PP);
+src/main/io/serial_4way.c:129:    IOConfigGPIO(escHardware[selEsc].io, IOCFG_IPU);
+src/main/io/serial_4way.c:134:    IOConfigGPIO(escHardware[selEsc].io, IOCFG_OUT_PP);
+src/main/io/serial_4way.c:161:        IOConfigGPIO(escHardware[escCount].io, IOCFG_AF_PP);
+src/main/msc/usbd_storage_sdio.c:154:	IOConfigGPIO(sd_det, IOCFG_IPU);
+src/main/osd_slave/osd_slave_init.c:119:    IOConfigGPIO(busSwitchResetPin, IOCFG_OUT_PP);
+src/main/rx/cc2500_frsky_shared.c:569:    IOConfigGPIO(gdoPin, IOCFG_IN_FLOATING);
+src/main/rx/cc2500_frsky_shared.c:573:    IOConfigGPIO(frSkyLedPin, IOCFG_OUT_PP);
+src/main/rx/cc2500_frsky_shared.c:578:    IOConfigGPIO(rxLnaEnPin, IOCFG_OUT_PP);
+src/main/rx/cc2500_frsky_shared.c:584:    IOConfigGPIO(txEnPin, IOCFG_OUT_PP);
+src/main/rx/cc2500_frsky_shared.c:589:    IOConfigGPIO(antSelPin, IOCFG_OUT_PP);
+src/main/rx/cc2500_frsky_shared.c:595:    IOConfigGPIO(bindPin, IOCFG_IPU);
+src/main/rx/flysky.c:368:    IOConfigGPIO(bindPin, IOCFG_IPU);
+src/main/rx/flysky.c:372:    IOConfigGPIO(flySkyLedPin, IOCFG_OUT_PP);
+src/main/rx/spektrum.c:191:        IOConfigGPIO(BindPlug, IOCFG_IPU);
+src/main/rx/spektrum.c:257:    IOConfigGPIO(bindIO, IOCFG_OUT_PP);
+src/main/rx/spektrum.c:290:        IOConfigGPIO(bindIO, IOCFG_IN_FLOATING);
+src/main/sensors/gyro.c:557:        IOConfigGPIO(gyroSensor1.gyroDev.bus.busdev_u.spi.csnPin, SPI_IO_CS_CFG);
+src/main/sensors/gyro.c:566:        IOConfigGPIO(gyroSensor2.gyroDev.bus.busdev_u.spi.csnPin, SPI_IO_CS_CFG);
+src/main/target/ALIENFLIGHTF3/hardware_revision.c:44:    IOConfigGPIO(HWDetectPin, IOCFG_IPU);
+src/main/target/ALIENFLIGHTF3/hardware_revision.c:48:    IOConfigGPIO(RXDetectPin, IOCFG_IPU);
+src/main/target/ALIENFLIGHTF4/hardware_revision.c:41:    IOConfigGPIO(HWDetectPin, IOCFG_IPU);
+src/main/target/ALIENFLIGHTNGF7/hardware_revision.c:42:    IOConfigGPIO(HWDetectPin, IOCFG_IPU);
+src/main/target/BLUEJAYF4/hardware_revision.c:44:    IOConfigGPIO(pin1, IOCFG_IPU);
+src/main/target/BLUEJAYF4/hardware_revision.c:58:        IOConfigGPIO(pin2, IOCFG_IPU);
+src/main/target/BLUEJAYF4/hardware_revision.c:66:        IOConfigGPIO(pin2, IOCFG_OUT_PP);
+src/main/target/BLUEJAYF4/initialisation.c:53:    IOConfigGPIO(inverter, IOCFG_OUT_PP);
+src/main/target/BLUEJAYF4/initialisation.c:72:        IOConfigGPIO(flashIo, IOCFG_OUT_PP);
+src/main/target/BLUEJAYF4/initialisation.c:76:        IOConfigGPIO(sdcardIo, IOCFG_OUT_PP);
+src/main/target/COLIBRI_RACE/bus_bst_stm32f30x.c:204:    IOConfigGPIOAF(scl, IOCFG_BST, GPIO_AF_4);
+src/main/target/COLIBRI_RACE/bus_bst_stm32f30x.c:207:    IOConfigGPIOAF(sda, IOCFG_BST, GPIO_AF_4);
+src/main/target/FF_FORTINIF4/hardware_revision.c:42:    IOConfigGPIO(HWDetectPin, IOCFG_IPU);
+src/main/target/KROOZX/initialisation.c:31:    IOConfigGPIO(osdChSwitch, IOCFG_OUT_PP);
+src/main/target/OMNINXT/hardware_revision.c:83:    IOConfigGPIO(IOGetByTag(idDetectTag), IO_CONFIG(GPIO_Mode_AN, 0, GPIO_OType_OD, GPIO_PuPd_NOPULL));
+src/main/target/OMNINXT/hardware_revision.c:125:    IOConfigGPIO(IOGetByTag(idDetectTag), IOCFG_IPU);
+src/main/target/OMNINXT/hardware_revision.c:194:    IOConfigGPIO(IOGetByTag(idDetectTag), IO_CONFIG(GPIO_MODE_ANALOG, 0, GPIO_NOPULL));
+src/main/target/OMNINXT/hardware_revision.c:226:    IOConfigGPIO(IOGetByTag(idDetectTag), IOCFG_IPU);
+src/main/target/YUPIF4/hardware_revision.c:40:    IOConfigGPIO(pin1, IOCFG_IPU);
+src/main/target/YUPIF4/hardware_revision.c:44:    IOConfigGPIO(pin2, IOCFG_IPU);
+src/main/target/YUPIF4/hardware_revision.c:48:    IOConfigGPIO(pin3, IOCFG_IPU);
+src/test/unit/baro_bmp280_unittest.cc:153:void IOConfigGPIO() {
+src/test/unit/baro_ms5611_unittest.cc:155:void IOConfigGPIO() {
